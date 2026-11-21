@@ -12,6 +12,7 @@ import { nodeHandler, ROUTE, throttled, type SettingsStatus } from "./gravity-se
 import { startToolBridge, type ToolBridge } from "./gravity-mcp.js";
 import { readOnlyRefusal } from "./gravity-plan-gate.js";
 import { agyEnv } from "./gravity-env.js";
+import { createQuotaService } from "./gravity-quota.js";
 
 export const name = "dsh-oh-my-gravity";
 export const inject = ["llm", "sessions", "connection"];
@@ -53,7 +54,9 @@ export const apply = (ctx: GravityContext, config: Schemastery.TypeT<typeof Conf
       (id, tool) => readOnlyRefusal(adapter.accessOf(id), tool),
     );
   })().catch(() => undefined);
+  const stateDir = process.env.DSH_GRAVITY_STATE_DIR || join(homedir(), ".local", "state", "dsh-oh-my-gravity");
   const settings = fileSettings();
+  let onTurnComplete = () => {};
   const adapter = new GravityAdapter({
     command: config.command,
     args: ["acp", "--sandbox"],
@@ -63,7 +66,8 @@ export const apply = (ctx: GravityContext, config: Schemastery.TypeT<typeof Conf
     idleMs: config.idleMinutes * 60_000,
     maxProcesses: config.maxProcesses,
     hidden: () => settings.get().hiddenModels,
-    catalogFile: join(process.env.DSH_GRAVITY_STATE_DIR || join(homedir(), ".local", "state", "dsh-oh-my-gravity"), "catalog.json"),
+    catalogFile: join(stateDir, "catalog.json"),
+    onTurnComplete: () => onTurnComplete(),
     log: (message) => console.warn(`[dsh-oh-my-gravity] ${message}`),
   }, (id) => {
     const cwd = id && ctx.sessions.get(id)?.header.cwd;
@@ -77,6 +81,14 @@ export const apply = (ctx: GravityContext, config: Schemastery.TypeT<typeof Conf
     const session = ctx.sessions.get(id);
     return session && gravityToolRows(session, GRAVITY_PROVIDER, model);
   }, async (id) => (settings.get().dshTools ? (await toolBridge())?.issue(id) : undefined));
+  const quotaService = createQuotaService({
+    command: config.command,
+    env,
+    cacheFile: join(stateDir, "quota.json"),
+    getPlan: async () => (await adapter.catalogStatus({ fresh: false })).plan,
+    log: (message) => console.warn(`[dsh-oh-my-gravity] ${message}`),
+  });
+  onTurnComplete = () => quotaService.noteTurnCompleted();
   ctx.llm.registerConfigurableProviders([{
     provider: GRAVITY_PROVIDER,
     displayName: "Oh My Gravity",
@@ -99,11 +111,20 @@ export const apply = (ctx: GravityContext, config: Schemastery.TypeT<typeof Conf
   // The Settings page's API; a composition without a web server simply has no page.
   ctx.inject?.(["webServer", "connection"], (host) => {
     const connection = Reflect.get(host, "connection") as { requestRejection(req: IncomingMessage): number | undefined } | undefined;
-    // Warm the model list while DSH starts, so neither the picker nor the Settings page waits on a cold AGY.
+    // Warm the model list and quota while DSH starts, so neither the picker, quota meter, nor Settings waits on a cold AGY.
     void adapter.catalogStatus({ fresh: false }).catch(() => undefined);
-    ctx.effect?.(() => host.webServer.register({ kind: "prefix", path: ROUTE, handler: nodeHandler({ settings, status }, (req) => (connection ? connection.requestRejection(req) : 503)) }), "dsh-oh-my-gravity: settings routes");
+    void quotaService.get({ fresh: false }).catch(() => undefined);
+    ctx.effect?.(() => host.webServer.register({
+      kind: "prefix",
+      path: ROUTE,
+      handler: nodeHandler(
+        { settings, status, quota: (fresh) => quotaService.get({ fresh }) },
+        (req) => (connection ? connection.requestRejection(req) : 503),
+      ),
+    }), "dsh-oh-my-gravity: settings routes");
   });
   return async () => {
+    quotaService.close();
     await adapter.close();
     await (await bridge)?.close();
   };

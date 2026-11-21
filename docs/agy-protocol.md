@@ -20,11 +20,11 @@ ACP is the only transport where a client can answer permission requests, so it i
 - **Models:** `session/new` returns `models.availableModels` (a model at several levels appears as `id-low`, `id-medium`, …) and `_meta.antigravity.tier` (the plan name). `session/set_model` switches. `usage_update.size` is the model's context window after a model is selected.
 - **Permissions:** `session/request_permission` carries a `toolCall` with `name`, `kind`, `title`, and optionally `rawInput` / `locations` (also delivered on preceding `tool_call` updates); MCP calls have `kind: "other"`. The plugin auto-allows `danger-full-access`, ordinary non-sensitive `read` tools in `read-only`/`workspace-write`, and bridged `mcp_dsh_*` calls (which enforce `readOnlyRefusal` in `gravity-mcp.ts` and delegate execution to DSH's own tools); all remaining asks build a readable `reason` from `tool_call` / `session/request_permission` metadata for DSH and Auto-Review.
 - **MCP:** `mcpServers` on `session/new` / `session/load` accepts an HTTP server with headers; AGY listed its tools and called them, asking permission first. The plugin uses this for DSH's tools.
-- **Usage:** prompt replies carry `inputTokens`, `outputTokens`, `cachedReadTokens`, `cachedWriteTokens`, `thoughtTokens`, `totalTokens`.
+- **Usage:** prompt replies carry `inputTokens` (already disjoint from cache tokens), `outputTokens`, `cachedReadTokens`, `cachedWriteTokens`, `thoughtTokens`, and `totalTokens`. Multi-step turns sum prompt tokens across internal LLM calls in `result.usage`, so `tokenUsage()` proportionally scales prompt counters down to the turn's latest `usage_update.used` when `promptTotal > used` to keep DSH's context meter accurate.
+- **Quota:** ACP does not carry plan quota buckets. Instead, `gravity-quota.ts` launches `agy --settings <tempSettings>` briefly inside a PTY (`python3` `pty.openpty()`) to capture AGY's documented `statusLine` JSON payload (remaining fraction + reset timestamps for Gemini / 3P 5-hour and weekly buckets), exiting on first quota emission without sending prompts or creating conversation files, cached on disk for 5 minutes.
 
 ## What AGY does not give a client
 
-- **Quota / credits:** not in the ACP stream. `/usage` is TUI-only; the documented `statusLine` command (which receives quota buckets) did not fire under `agy acp` in a test.
 - **Deleting a conversation:** `session/close` leaves the conversation file; there is no delete method. Every `session/new` creates a ~400 KB file, so the plugin removes the empty one its own model-list probe creates.
 - **Which MCP server a permission request belongs to:** only the tool name (`mcp_<server>_<tool>`).
 

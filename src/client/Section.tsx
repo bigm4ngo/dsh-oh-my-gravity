@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
+import { formatPercent, formatReset, loadQuota, remainingTone, type QuotaReply } from "./quota.js";
 
 const ROUTE = "/dsh-oh-my-gravity";
 
@@ -37,10 +38,28 @@ function Switch(props: { checked: boolean; disabled?: boolean; label: string; on
   );
 }
 
+const TONE_CLASS = { err: "omg-bad", warn: "omg-warn", ok: "omg-good" } as const;
+const TONE_FILL = {
+  err: "var(--dsw-alias-state-error-primary, #dc2626)",
+  warn: "var(--dsw-alias-state-warn-primary, #d9822b)",
+  ok: "var(--dsw-alias-state-success-primary, #16a34a)",
+} as const;
+
 export function Section() {
   const [status, setStatus] = useState<Status>();
+  const [quota, setQuota] = useState<QuotaReply>();
   const [error, setError] = useState<string>();
   const [busy, setBusy] = useState(false);
+  const [quotaBusy, setQuotaBusy] = useState(false);
+
+  const refreshQuota = useCallback(async (fresh = false) => {
+    setQuotaBusy(true);
+    try {
+      setQuota(await loadQuota(fresh));
+    } finally {
+      setQuotaBusy(false);
+    }
+  }, []);
 
   const load = useCallback(async (fresh = false) => {
     setBusy(true);
@@ -53,7 +72,11 @@ export function Section() {
       setBusy(false);
     }
   }, []);
-  useEffect(() => { void load(); }, [load]);
+
+  useEffect(() => {
+    void load();
+    void refreshQuota(false);
+  }, [load, refreshQuota]);
 
   const save = async (change: Partial<Status["settings"]>) => {
     try {
@@ -86,6 +109,37 @@ export function Section() {
           {status.signedIn ? <span className="omg-good">signed in</span> : <span className="omg-bad">AGY did not answer; run <code>agy</code> once to sign in</span>}
         </div>
         <div className="omg-row"><span className="omg-dim">Shown from the last check; "Check again" asks AGY now.</span><button className="omg-btn" disabled={busy} onClick={() => { void load(true); }}>{busy ? "Checking…" : "Check again"}</button></div>
+      </div>
+
+      <div className="omg-card">
+        <h3>Plan quota</h3>
+        {!quota ? (
+          <div className="omg-dim">Checking quota…</div>
+        ) : !quota.ok ? (
+          <div className="omg-bad">{quota.error}</div>
+        ) : (
+          quota.buckets.map((bucket) => {
+            const tone = remainingTone(bucket.remainingPercent);
+            const pct = Math.max(0, Math.min(100, bucket.remainingPercent));
+            const reset = formatReset(bucket.resetsAt);
+            return (
+              <div className="omg-quota-item" key={bucket.id}>
+                <div className="omg-quota-head">
+                  <span>{bucket.label}{bucket.disabled ? <span className="omg-dim"> (paused)</span> : null}</span>
+                  <span className={`omg-quota-val ${TONE_CLASS[tone]}`}>{formatPercent(pct)} left</span>
+                </div>
+                <div className="omg-quota-bar" role="progressbar" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(pct)} aria-label={`${bucket.label} ${formatPercent(pct)} remaining`}>
+                  <div className="omg-quota-fill" style={{ width: `${pct}%`, background: TONE_FILL[tone] }} />
+                </div>
+                {reset ? <div className="omg-quota-meta">{reset}</div> : null}
+              </div>
+            );
+          })
+        )}
+        <div className="omg-row">
+          <span className="omg-dim">{quota?.ok ? `Updated ${new Date(quota.fetchedAt).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}` : "Reads AGY's statusLine quota payload."}</span>
+          <button className="omg-btn" disabled={quotaBusy} onClick={() => { void refreshQuota(true); }}>{quotaBusy ? "Refreshing…" : "Refresh quota"}</button>
+        </div>
       </div>
 
       <div className="omg-card">

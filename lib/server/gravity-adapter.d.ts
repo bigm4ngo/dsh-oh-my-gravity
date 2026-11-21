@@ -1,4 +1,4 @@
-import { LlmAdapter, type GenerateOptions, type LlmResolvedModelInfo, type StreamChunk } from "@deepseek-ai/dsh-llm";
+import { LlmAdapter, type GenerateOptions, type LlmResolvedModelInfo, type StreamChunk, type TokenUsage } from "@deepseek-ai/dsh-llm";
 import { AgyConnection } from "./agy-connection.js";
 import type { ResumeMap } from "./gravity-store.js";
 import type { McpServerConfig } from "./gravity-mcp.js";
@@ -21,6 +21,7 @@ type LaunchOptions = Omit<ConnectionOptions, "cwd" | "timeoutMs"> & {
     idleMs?: number;
     reapEveryMs?: number;
     maxProcesses?: number;
+    onTurnComplete?: () => void;
     log?: (message: string) => void;
 };
 type Fields = Record<string, unknown>;
@@ -50,6 +51,7 @@ export type ToolCallMeta = {
 };
 /** Builds a human- and Auto-Review-readable explanation from permission/tool-call metadata. */
 export declare function describePermission(toolName: string, call: Fields | undefined, prev?: ToolCallMeta): string;
+export declare function tokenUsage(value: unknown, contextUsed?: number): TokenUsage | undefined;
 export declare const GRAVITY_PROVIDER = "antigravity";
 /** ACP-backed provider. AGY owns execution; only explicit, one-time host approvals are relayed. */
 export declare class GravityAdapter extends LlmAdapter {

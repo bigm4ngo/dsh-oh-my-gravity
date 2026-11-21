@@ -35,8 +35,8 @@
     "typecheck": "tsc --noEmit",
     "test": "find src -name '*.test.ts' | xargs -P 8 -I{} bun {}",
     "build:server": "rm -rf lib/server && tsc -p tsconfig.build.json",
-    "build": "bun run build:server && bun run build:client",
-    "build:client": "NODE_ENV=production bun build src/client/index.tsx --format=cjs --target=browser --minify --outfile=lib/client.js --external react --external react/jsx-runtime --external react-dom --banner='window.__ModuleLoader__.load({ id: \"dsh-oh-my-gravity\", factory: (require) => { var module = { exports: {} }; var exports = module.exports;' --footer='return module.exports; } });'"
+    "build": "npm run build:server && npm run build:client",
+    "build:client": "node tools/build-client.mjs"
   },
   "dependencies": {},
   "devDependencies": {

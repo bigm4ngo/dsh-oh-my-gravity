@@ -7,7 +7,8 @@ Run your signed-in [Antigravity CLI](https://antigravity.google/docs/cli) (`agy`
 ## What you get
 
 - AGY's models in DSH's picker, one entry per model, with the effort chooser for models AGY ships at several levels (Gemini: low/medium/high/xhigh).
-- Streaming text and reasoning, token usage, context windows, cancel, and resume after a DSH restart.
+- Streaming text and reasoning, token usage (`Cache hit %`, context ring scaling across multi-step tool loops), context windows, cancel, and resume after a DSH restart.
+- Plan quota (`% left` and reset countdowns) in DSH's context-meter hover tooltip, context popover, and Settings → Oh My Gravity card (read via AGY's documented `statusLine` JSON, cached 5 minutes).
 - AGY's tool activity as DSH tool rows, and AGY's permission requests answered through DSH's own approval setting.
 - DSH's tools (subagents, jobs, skills, …) available to AGY, each call approved through DSH.
 - DSH's access mode (read-only / workspace-write / full access) driving AGY's own mode.
@@ -56,7 +57,7 @@ DSH starts `agy acp --sandbox` per DSH session and talks to it over the [Agent C
 
 ## Not supported
 
-- **Usage and quota.** AGY exposes nothing equivalent to a client: `/usage` is a terminal panel, the `statusLine` hook that carries quota does not run under `agy acp`, and the ACP stream has no quota fields. Settings shows your plan name (e.g. "Google AI Pro") and DSH's context ring shows tokens, but not remaining quota. Reading Google's undocumented endpoints was not attempted.
+- **`tok/s` on tool-using turns and per-tool step counts.** Because AGY runs its internal tool loop inside one DSH `stream()` step, DSH counts one step per turn rather than one per internal tool call; furthermore, DSH's `dsh-session-stats` closes `openStep` on the first `assistant/message` row (the synthetic tool-call announcement required by DSH v4 session validation), so `tok/s` and TTFT are recorded only on non-tool turns .
 - **Cost rows.** AGY reports tokens, not prices, and DSH's usage record has no cost field.
 - **Claude panel features** (rewind, memory, skills, MCP and asides panels, SSH boxes, a panel UI): they depended on Claude Code internals AGY does not expose, so they were removed rather than half-ported.
 - **DSH file and shell tools** are not served to AGY (it has its own). DSH tools run with no abort wiring: cancelling an AGY turn does not stop a DSH tool already running.

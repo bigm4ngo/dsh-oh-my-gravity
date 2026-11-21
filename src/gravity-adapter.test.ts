@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createUserMessage, type GenerateOptions } from "@deepseek-ai/dsh-llm";
-import { describePermission, GravityAdapter } from "./gravity-adapter.js";
+import { describePermission, GravityAdapter, tokenUsage } from "./gravity-adapter.js";
 import type { ApprovalOutcome } from "./dsh.js";
 
 // Real stdio transport. The child checks that the adapter uses the intended wire requests.
@@ -23,7 +23,7 @@ require('node:readline').createInterface({input:process.stdin}).on('line', line 
   update('fixture','thinking','agent_thought_chunk');
   update('fixture','turn ' + (++turns) + ': ');
   update('fixture',prompt.text);
-  send({id:m.id,result:{stopReason:'end_turn',usage:{inputTokens:12,cachedReadTokens:4,cachedWriteTokens:1,outputTokens:5,thoughtTokens:2,totalTokens:17}}});
+  send({id:m.id,result:{stopReason:'end_turn',usage:{inputTokens:12,cachedReadTokens:4,cachedWriteTokens:1,outputTokens:5,thoughtTokens:2,totalTokens:22}}});
 });`;
 const adapter = new GravityAdapter({ command: process.execPath, args: ["-e", script], env: process.env }, () => process.cwd());
 const options = (text: string, session = "same"): GenerateOptions => ({
@@ -47,7 +47,7 @@ try {
       { type: "text-delta", index: 1, text: `turn ${n}: ` },
       { type: "text-delta", index: 1, text: word },
       { type: "block-end", index: 1, block: { type: "text", text: `turn ${n}: ${word}` } },
-      { type: "usage", usage: { inputTokens: 7, outputTokens: 5, totalTokens: 17, cacheReadTokens: 4, cacheWriteTokens: 1, reasoningTokens: 2 } },
+      { type: "usage", usage: { inputTokens: 12, outputTokens: 5, totalTokens: 22, cacheReadTokens: 4, cacheWriteTokens: 1, reasoningTokens: 2 } },
       { type: "finish", reason: { kind: "stop" } },
     ]);
   }
@@ -261,5 +261,66 @@ try {
 }
 assert.ok(lines.some((l) => /permission "Read synthetic fixture" \(read\) → DSH allowed-once/.test(l)), JSON.stringify(lines));
 assert.ok(lines.some((l) => /permission "Read synthetic fixture" \(read\) → DSH rejected/.test(l)), JSON.stringify(lines));
+
+// tokenUsage handles disjoint AGY counters, cacheReadTokens > inputTokens, reasoning clamp, zero cache, legacy inclusive, and contextUsed scaling.
+assert.deepEqual(
+  tokenUsage({ inputTokens: 2219, cachedReadTokens: 8516, cachedWriteTokens: 0, outputTokens: 29, thoughtTokens: 27, totalTokens: 10764 }),
+  { inputTokens: 2219, outputTokens: 29, totalTokens: 10764, cacheReadTokens: 8516, cacheWriteTokens: 0, reasoningTokens: 27 },
+);
+assert.deepEqual(
+  tokenUsage({ inputTokens: 10573, outputTokens: 86, thoughtTokens: 84, totalTokens: 10659 }),
+  { inputTokens: 10573, outputTokens: 86, totalTokens: 10659, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 84 },
+);
+assert.deepEqual(
+  tokenUsage({ inputTokens: 100, outputTokens: 10, thoughtTokens: 25, totalTokens: 110 }),
+  { inputTokens: 100, outputTokens: 10, totalTokens: 110, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 10 },
+);
+assert.deepEqual(
+  tokenUsage({ inputTokens: 12, cachedReadTokens: 4, cachedWriteTokens: 1, outputTokens: 5, totalTokens: 17 }),
+  { inputTokens: 7, outputTokens: 5, totalTokens: 17, cacheReadTokens: 4, cacheWriteTokens: 1 },
+);
+// Single-step turn where prompt <= contextUsed is not scaled down.
+assert.deepEqual(
+  tokenUsage({ inputTokens: 2219, cachedReadTokens: 8516, cachedWriteTokens: 0, outputTokens: 29, totalTokens: 10764 }, 11000),
+  { inputTokens: 2219, outputTokens: 29, totalTokens: 10764, cacheReadTokens: 8516, cacheWriteTokens: 0 },
+);
+// Multi-step turn where summed prompt (13548 + 13941 = 27489) exceeds usage_update.used (9603) scales prompt proportionally while keeping output intact.
+const scaled = tokenUsage(
+  { inputTokens: 13548, cachedReadTokens: 13941, cachedWriteTokens: 0, outputTokens: 389, thoughtTokens: 249, totalTokens: 27878 },
+  9603,
+);
+assert.ok(scaled);
+assert.equal(scaled.inputTokens + (scaled.cacheReadTokens ?? 0) + (scaled.cacheWriteTokens ?? 0), 9603);
+assert.equal(scaled.outputTokens, 389);
+assert.equal(scaled.reasoningTokens, 249);
+assert.equal(scaled.totalTokens, 9603 + 389);
+const originalHit = 13941 / 27489;
+const scaledHit = (scaled.cacheReadTokens ?? 0) / 9603;
+assert.ok(Math.abs(originalHit - scaledHit) < 0.001, `cache ratio drifted: ${originalHit} vs ${scaledHit}`);
+
+// End-to-end: usage_update.used scales multi-step result.usage prompt counters emitted by GravityAdapter.stream().
+const multiStepFixture = String.raw`
+const send = m => console.log(JSON.stringify({jsonrpc:'2.0',...m}));
+require('node:readline').createInterface({input:process.stdin}).on('line', line => {
+  const m = JSON.parse(line);
+  if (m.method === 'initialize') return send({id:m.id,result:{protocolVersion:1}});
+  if (m.method === 'session/new') return send({id:m.id,result:{sessionId:'fixture'}});
+  if (m.method === 'session/prompt') {
+    send({ method: 'session/update', params: { sessionId: 'fixture', update: { sessionUpdate: 'usage_update', used: 9056, size: 1048576 } } });
+    send({ method: 'session/update', params: { sessionId: 'fixture', update: { sessionUpdate: 'usage_update', used: 9603, size: 1048576 } } });
+    send({ method: 'session/update', params: { sessionId: 'fixture', update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'done' } } } });
+    return send({ id: m.id, result: { stopReason: 'end_turn', usage: { inputTokens: 13548, cachedReadTokens: 13941, cachedWriteTokens: 0, outputTokens: 389, thoughtTokens: 249, totalTokens: 27878 } } });
+  }
+});`;
+const scaledAdapter = new GravityAdapter({ command: process.execPath, args: ['-e', multiStepFixture], env: process.env }, () => process.cwd());
+try {
+  const chunks = await collect(scaledAdapter.stream(options('multi', 'multi-s')));
+  const usageChunk = chunks.find((c) => c.type === 'usage');
+  assert.ok(usageChunk && usageChunk.type === 'usage');
+  assert.equal(usageChunk.usage.inputTokens + (usageChunk.usage.cacheReadTokens ?? 0) + (usageChunk.usage.cacheWriteTokens ?? 0), 9603);
+  assert.equal(usageChunk.usage.outputTokens, 389);
+} finally {
+  await scaledAdapter.close();
+}
 
 console.log("gravity adapter: ok");

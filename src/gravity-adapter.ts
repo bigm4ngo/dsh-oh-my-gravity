@@ -25,6 +25,7 @@ type LaunchOptions = Omit<ConnectionOptions, "cwd" | "timeoutMs"> & { models?: r
   idleMs?: number;
   reapEveryMs?: number;
   maxProcesses?: number;
+  onTurnComplete?: () => void;
   log?: (message: string) => void;
 };
 type Fields = Record<string, unknown>;
@@ -336,23 +337,38 @@ async function decidePermission(
 const count = (value: unknown): number | undefined =>
   typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
 
-function tokenUsage(value: unknown): TokenUsage | undefined {
+export function tokenUsage(value: unknown, contextUsed?: number): TokenUsage | undefined {
   const u = object(value);
   const input = count(u?.inputTokens);
   const outputTokens = count(u?.outputTokens);
-  const cacheReadTokens = count(u?.cachedReadTokens);
-  const cacheWriteTokens = count(u?.cachedWriteTokens);
+  const cacheRead = count(u?.cachedReadTokens) ?? 0;
+  const cacheWrite = count(u?.cachedWriteTokens) ?? 0;
   if (input === undefined || outputTokens === undefined) return;
-  const inputTokens = input - (cacheReadTokens ?? 0) - (cacheWriteTokens ?? 0);
-  if (inputTokens < 0) return;
-  const totalTokens = count(u?.totalTokens);
-  const reasoningTokens = count(u?.thoughtTokens);
+  const rawTotal = count(u?.totalTokens);
+  const inclusive = rawTotal === input + outputTokens && (cacheRead > 0 || cacheWrite > 0) && input >= cacheRead + cacheWrite;
+  let inputTokens = inclusive ? input - cacheRead - cacheWrite : input;
+  let cacheReadTokens = cacheRead;
+  let cacheWriteTokens = cacheWrite;
+  const promptTotal = inputTokens + cacheReadTokens + cacheWriteTokens;
+  if (typeof contextUsed === "number" && Number.isSafeInteger(contextUsed) && contextUsed > 0 && promptTotal > contextUsed) {
+    const scale = contextUsed / promptTotal;
+    cacheReadTokens = Math.round(cacheReadTokens * scale);
+    cacheWriteTokens = Math.round(cacheWriteTokens * scale);
+    if (cacheReadTokens + cacheWriteTokens > contextUsed) {
+      cacheWriteTokens = Math.min(cacheWriteTokens, contextUsed);
+      cacheReadTokens = Math.max(0, contextUsed - cacheWriteTokens);
+    }
+    inputTokens = contextUsed - cacheReadTokens - cacheWriteTokens;
+  }
+  const rawThought = count(u?.thoughtTokens);
+  const reasoningTokens = rawThought === undefined ? undefined : Math.min(rawThought, outputTokens);
+  const totalTokens = inputTokens + cacheReadTokens + cacheWriteTokens + outputTokens;
   return {
     inputTokens,
     outputTokens,
-    ...(totalTokens === input + outputTokens ? { totalTokens } : {}),
-    ...(cacheReadTokens === undefined ? {} : { cacheReadTokens }),
-    ...(cacheWriteTokens === undefined ? {} : { cacheWriteTokens }),
+    totalTokens,
+    cacheReadTokens,
+    cacheWriteTokens,
     ...(reasoningTokens === undefined ? {} : { reasoningTokens }),
   };
 }
@@ -713,6 +729,7 @@ export class GravityAdapter extends LlmAdapter {
       let failed: { error: unknown } | undefined;
       let finished = false;
       let bytes = 0;
+      let lastContextUsed: number | undefined;
       const endBlock = () => {
         if (block) chunks.push({ type: "block-end", index: index++, block });
         block = undefined;
@@ -721,6 +738,8 @@ export class GravityAdapter extends LlmAdapter {
         const update = object(raw);
         const kind = update?.sessionUpdate;
         if (kind === "usage_update") {
+          const used = update?.used;
+          if (typeof used === "number" && Number.isSafeInteger(used) && used > 0) lastContextUsed = used;
           const size = update?.size;
           if (typeof size === "number" && Number.isSafeInteger(size) && size > 0 && session.model) {
             this.contexts.set(session.model, size);
@@ -804,7 +823,7 @@ export class GravityAdapter extends LlmAdapter {
         yield { type: "text-delta", index, text };
         yield { type: "block-end", index, block: { type: "text", text } };
       }
-      const usage = tokenUsage(result?.usage);
+      const usage = tokenUsage(result?.usage, lastContextUsed);
       if (usage) yield { type: "usage", usage };
       const stop = result?.stopReason;
       completed = true;
@@ -833,6 +852,7 @@ export class GravityAdapter extends LlmAdapter {
           if (key && this.sessions.get(key) === session) this.sessions.delete(key);
           await this.release(session);
         }
+        if (completed) this.launch.onTurnComplete?.();
       }
     }
   }

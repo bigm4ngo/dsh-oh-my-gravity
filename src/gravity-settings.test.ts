@@ -24,16 +24,31 @@ assert.deepEqual(fileSettings(file).get(), { hiddenModels: ["ok"], dshTools: tru
 const status: SettingsStatus = { command: "agy", version: "1.5.13", signedIn: true, models: [{ id: "m-a", name: "Model A" }], lockedModels: ["m-b"] };
 const live = fileSettings(join(dir, "routes.json"));
 const freshAsked: boolean[] = [];
+const quotaFreshAsked: boolean[] = [];
 const call = async (method: string, path: string, body?: unknown, raw?: string) => {
   const response = await handleSettings(new Request(`http://x/dsh-oh-my-gravity${path}`, {
     method, ...(body !== undefined || raw !== undefined ? { body: raw ?? JSON.stringify(body), headers: { "content-type": "application/json" } } : {}),
-  }), { settings: live, status: async (fresh) => { freshAsked.push(fresh); return status; } });
+  }), {
+    settings: live,
+    status: async (fresh) => { freshAsked.push(fresh); return status; },
+    quota: async (fresh) => {
+      quotaFreshAsked.push(fresh);
+      return { ok: true, fetchedAt: 123, buckets: [{ id: "gemini-5h", label: "Gemini 5-hour", family: "gemini", window: "5h", remainingPercent: 80, usedPercent: 20, resetsAt: 999 }] };
+    },
+  });
   return { status: response.status, body: await response.json() as Record<string, unknown> };
 };
 assert.deepEqual(await call("GET", "/api/status"), { status: 200, body: { ...status, settings: { hiddenModels: [], dshTools: true } } });
 // Opening the page answers from what is already known; only "Check again" (?fresh=1) asks AGY anew.
 assert.equal((await call("GET", "/api/status?fresh=1")).status, 200);
 assert.deepEqual(freshAsked, [false, true]);
+const quotaRes = await call("GET", "/api/quota");
+assert.equal(quotaRes.status, 200);
+assert.equal(quotaRes.body.ok, true);
+assert.equal((await call("GET", "/api/quota?fresh=1")).status, 200);
+assert.deepEqual(quotaFreshAsked, [false, true]);
+assert.equal((await call("POST", "/api/quota", {})).status, 405);
+assert.equal((await handleSettings(new Request("http://x/dsh-oh-my-gravity/api/quota", { headers: { "sec-fetch-site": "cross-site" } }), { settings: live, status: async () => status })).status, 403);
 assert.equal((await call("POST", "/api/settings", { hiddenModels: ["m-a"], dshTools: false })).status, 200);
 assert.deepEqual(live.get(), { hiddenModels: ["m-a"], dshTools: false });
 assert.equal((await call("POST", "/api/settings", { dshTools: true })).status, 200); // partial update keeps the rest

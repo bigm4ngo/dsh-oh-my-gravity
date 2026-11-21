@@ -1,6 +1,7 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { Readable } from "node:stream";
 import type { GravitySettings, SettingsStore } from "./gravity-settings.js";
+import type { QuotaReply } from "./gravity-quota.js";
 
 export const ROUTE = "/dsh-oh-my-gravity";
 const BODY_LIMIT = 64 * 1024;
@@ -23,6 +24,8 @@ export interface SettingsDeps {
   settings: SettingsStore;
   /** `fresh`: ask AGY anew instead of answering from what is already known. */
   status: (fresh: boolean) => Promise<SettingsStatus>;
+  /** Current Antigravity plan quota; optional for tests/hosts that omit quota probing. */
+  quota?: (fresh: boolean) => Promise<QuotaReply>;
 }
 
 /** DSH's Host/Origin fence plus sign-in check: an HTTP status to refuse with, or undefined to let the request through. */
@@ -50,8 +53,8 @@ async function readCapped(request: Request, limit: number): Promise<string | und
   return Buffer.concat(parts).toString("utf8");
 }
 
-/** The Settings page's API: GET /api/status, POST /api/settings. Every failure is a JSON body with a status. */
-export async function handleSettings(request: Request, { settings, status }: SettingsDeps): Promise<Response> {
+/** The Settings page's API: GET /api/status, GET /api/quota, POST /api/settings. Every failure is a JSON body with a status. */
+export async function handleSettings(request: Request, { settings, status, quota }: SettingsDeps): Promise<Response> {
   const path = new URL(request.url).pathname.slice(ROUTE.length).replace(/\/+$/, "");
   const method = request.method.toUpperCase();
   // Only this page may use the API: a browser tab on another origin, even another localhost port, is refused.
@@ -62,6 +65,11 @@ export async function handleSettings(request: Request, { settings, status }: Set
     if (path === "/api/status") {
       if (method !== "GET") return failure("method not allowed", 405);
       return json({ ...(await status(new URL(request.url).searchParams.get("fresh") === "1")), settings: settings.get() });
+    }
+    if (path === "/api/quota") {
+      if (method !== "GET") return failure("method not allowed", 405);
+      if (!quota) return json({ ok: false, error: "quota unavailable" }, 501);
+      return json(await quota(new URL(request.url).searchParams.get("fresh") === "1"));
     }
     if (path === "/api/settings") {
       if (method !== "POST") return failure("method not allowed", 405);
