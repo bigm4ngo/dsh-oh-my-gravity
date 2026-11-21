@@ -1,0 +1,5 @@
+# Register the Gravity provider without changing other providers in the profile.
+- insert:
+    - id: oh-my-gravity
+      name: 'dsh-oh-my-gravity'
+      config: {}

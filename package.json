@@ -1,0 +1,94 @@
+{
+  "name": "dsh-oh-my-gravity",
+  "version": "0.1.0-alpha.1",
+  "private": true,
+  "type": "module",
+  "description": "Unofficial Antigravity CLI provider for DeepSeek Harness using the Agent Client Protocol",
+  "author": "bigm4ngo",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/bigm4ngo/dsh-oh-my-gravity.git"
+  },
+  "homepage": "https://github.com/bigm4ngo/dsh-oh-my-gravity#readme",
+  "bugs": {
+    "url": "https://github.com/bigm4ngo/dsh-oh-my-gravity/issues"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "antigravity",
+    "agy",
+    "acp",
+    "llm-provider"
+  ],
+  "main": "lib/server/gravity.js",
+  "exports": {
+    ".": {
+      "types": "./lib/server/gravity.d.ts",
+      "default": "./lib/server/gravity.js"
+    },
+    "./package.json": "./package.json",
+    "./client": "./lib/client.js"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "find src -name '*.test.ts' | xargs -P 8 -I{} bun {}",
+    "build:server": "rm -rf lib/server && tsc -p tsconfig.build.json",
+    "build": "bun run build:server && bun run build:client",
+    "build:client": "NODE_ENV=production bun build src/client/index.tsx --format=cjs --target=browser --minify --outfile=lib/client.js --external react --external react/jsx-runtime --external react-dom --banner='window.__ModuleLoader__.load({ id: \"dsh-oh-my-gravity\", factory: (require) => { var module = { exports: {} }; var exports = module.exports;' --footer='return module.exports; } });'"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@deepseek-ai/dsh-llm": "0.1.6-alpha.1",
+    "@types/node": "^26.4.1",
+    "@types/react": "18",
+    "react": "18",
+    "typescript": "^7.0.2"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-llm": ">=0.2.2-alpha.2 <0.3.0",
+    "@deepseek-ai/cordis": "^4.0.2",
+    "@deepseek-ai/schemastery": "^3.18.0",
+    "react": "^18.2.0"
+  },
+  "engines": {
+    "node": ">=22.15.0",
+    "dsh": ">=0.2.2-alpha.2 <0.3.0"
+  },
+  "files": [
+    "lib",
+    "README.md",
+    "LICENSE",
+    "cordis.patch.yml",
+    "icon.svg"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-locale"
+      ]
+    }
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/dsh-llm": {
+      "optional": true
+    },
+    "@deepseek-ai/cordis": {
+      "optional": true
+    },
+    "@deepseek-ai/schemastery": {
+      "optional": true
+    },
+    "react": {
+      "optional": true
+    }
+  },
+  "types": "lib/server/gravity.d.ts",
+  "icon": "icon.svg"
+}
