@@ -33,4 +33,64 @@ assert.deepEqual(asked, ["dsh-1"]);
 assert.equal(revoked, 0);
 await adapter.close();
 assert.equal(revoked, 1); // the credential dies with its AGY process
+
+// Bridged mcp_dsh_* permissions defer to the DSH tool bridge (with callId correlated) instead of prompting twice.
+const permScript = String.raw`
+const send = m => console.log(JSON.stringify({jsonrpc:'2.0',...m}));
+let pendingPrompt;
+const asks = [
+  { id: 'p1', toolCall: { toolCallId: 'c1', name: 'mcp_dsh_echo', kind: 'other' } },
+  { id: 'p2', toolCall: { toolCallId: 'c2', name: 'mcp_dsh_unowned', kind: 'other' } },
+  { id: 'p3', toolCall: { toolCallId: 'c3', name: 'run_command', kind: 'execute', rawInput: { CommandLine: 'ls' } } },
+];
+let step = 0;
+function askNext() {
+  const next = asks[step++];
+  if (!next) return send({ id: pendingPrompt.id, result: { stopReason: 'end_turn' } });
+  send({ method: 'session/update', params: { sessionId: 's', update: { sessionUpdate: 'tool_call', ...next.toolCall } } });
+  send({ id: next.id, method: 'session/request_permission', params: { sessionId: 's', toolCall: next.toolCall, options: [{ kind: 'allow_once', optionId: 'yes' }, { kind: 'reject_once', optionId: 'no' }] } });
+}
+require('node:readline').createInterface({input:process.stdin}).on('line', line => {
+  const m = JSON.parse(line);
+  if (m.method === 'initialize') return send({id:m.id,result:{protocolVersion:1}});
+  if (m.method === 'session/new') return send({id:m.id,result:{sessionId:'s'}});
+  if (m.method === 'session/prompt') { pendingPrompt = m; return askNext(); }
+  if (m.id === 'p1' || m.id === 'p2' || m.id === 'p3') {
+    if (m.result?.outcome?.optionId !== 'yes') process.exit(4);
+    return askNext();
+  }
+});`;
+const approvedCalls: Array<{ toolName: string; callId: string; reason: string }> = [];
+const rowIds = new Map([["c1", "row-uuid-1"], ["c2", "row-uuid-2"], ["c3", "row-uuid-3"]]);
+const deferAdapter = new GravityAdapter(
+  { command: process.execPath, args: ["-e", permScript], env: process.env },
+  () => process.cwd(),
+  async (req) => {
+    approvedCalls.push({ toolName: req.toolName, callId: req.callId, reason: req.reason });
+    return "allowed-once";
+  },
+  undefined,
+  () => ({ callId: (id: string) => rowIds.get(id), update() {}, finish() {} }) as never,
+  async () => ({
+    config,
+    revoke() {},
+    ownsTool: (tool: string) => tool === "echo",
+  }),
+);
+try {
+  for await (const _ of deferAdapter.stream({
+    provider: "antigravity",
+    model: "default",
+    sessionId: "dsh-2" as GenerateOptions["sessionId"],
+    messages: [createUserMessage({ content: [{ type: "text", text: "go" }], source: { kind: "user" } })],
+  })) { /* drain */ }
+} finally {
+  await deferAdapter.close();
+}
+assert.deepEqual(approvedCalls.map((c) => [c.toolName, c.callId]), [
+  ["mcp_dsh_unowned", "row-uuid-2"],
+  ["run_command", "row-uuid-3"],
+]);
+assert.match(approvedCalls[1]!.reason, /ls/);
+
 console.log("gravity adapter mcp: ok");

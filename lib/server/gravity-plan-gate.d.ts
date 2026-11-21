@@ -1,6 +1,12 @@
 import type { GenerateOptions } from "@deepseek-ai/dsh-llm";
-/** DSH's access mode is AGY's session mode: read-only plans, workspace-write accepts edits in the workspace, full access runs auto. */
+/** DSH's access mode is AGY's session mode: read-only plans, workspace-write runs auto inside `agy acp --sandbox`, and danger-full-access uses `--dangerously-skip-permissions` when configured. */
 export declare const MODE_FOR_ACCESS: Readonly<Record<string, string>>;
+export declare const READ_ONLY_AGY_TOOLS: ReadonlySet<string>;
+/**
+ * In `read-only` and `workspace-write`, ordinary reads outside the workspace match native DSH
+ * and are auto-allowed unless any target path touches sensitive credential/key locations.
+ */
+export declare function isAutoAllowedRead(access: string | undefined, toolName: string, kind: string | undefined, paths: readonly string[]): boolean;
 /**
  * DSH's access mode, from the runtime-context message DSH injects each turn: the `sandbox:policy` section of its structured
  * `source`, which only DSH sets. Message text is never read, so a pasted page or a user-authored line cannot claim a

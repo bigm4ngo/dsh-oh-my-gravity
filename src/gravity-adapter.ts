@@ -6,13 +6,15 @@ import { dirname, join } from "node:path";
 import { AgyConnection } from "./agy-connection.js";
 import type { ResumeMap } from "./gravity-store.js";
 import type { McpServerConfig } from "./gravity-mcp.js";
-import { accessModeOf, MODE_FOR_ACCESS } from "./gravity-plan-gate.js";
+import { accessModeOf, isAutoAllowedRead, MODE_FOR_ACCESS } from "./gravity-plan-gate.js";
 import type { ApprovalOutcome, SessionId } from "./dsh.js";
 import type { gravityToolRows } from "./gravity-tool-rows.js";
 
 type ConnectionOptions = ConstructorParameters<typeof AgyConnection>[0];
 /** `models`: ids the picker offers (empty or absent: all). `hidden`: ids the Settings page currently hides. */
-type LaunchOptions = Omit<ConnectionOptions, "cwd" | "timeoutMs"> & { models?: readonly string[]; hidden?: () => readonly string[]; 
+type LaunchOptions = Omit<ConnectionOptions, "cwd" | "timeoutMs"> & { models?: readonly string[]; hidden?: () => readonly string[];
+  /** Launch args used when DSH access is `danger-full-access` (e.g. `["acp", "--dangerously-skip-permissions"]`). */
+  fullAccessArgs?: readonly string[];
   /** Where the last good model list is kept, so a restart or a failed AGY start still shows models. */
   catalogFile?: string;
   /** How long a model list counts as fresh; a stale one is still answered at once and refreshed behind. */
@@ -26,9 +28,15 @@ type LaunchOptions = Omit<ConnectionOptions, "cwd" | "timeoutMs"> & { models?: r
   log?: (message: string) => void;
 };
 type Fields = Record<string, unknown>;
+type McpGrant = {
+  config: McpServerConfig;
+  revoke(): void;
+  ownsTool?: (tool: string) => boolean;
+};
 type Session = {
   connection: AgyConnection;
   cwd: string;
+  fullAccess: boolean;
   id?: string;
   busy: boolean;
   lastUsed: number;
@@ -45,6 +53,7 @@ type Session = {
   defaultMode?: string;
   mode?: string;
   revokeMcp?: () => void;
+  mcpBridge?: McpGrant;
 };
 
 type Catalog = { id: string; name: string }[];
@@ -96,16 +105,193 @@ export type GravityApproval = (request: {
   sessionId: SessionId;
   callId: string;
   toolName: string;
+  reason: string;
   signal: AbortSignal;
 }) => Promise<ApprovalOutcome>;
 
-async function decidePermission(params: Fields, sessionId: SessionId, signal: AbortSignal, approve: GravityApproval, rows?: ReturnType<typeof gravityToolRows>, refused?: (toolName: string) => void, log?: (message: string) => void) {
+const MAX_REASON = 4000;
+const COMMAND_KEYS = new Set(["CommandLine", "command", "BypassSandbox", "IsDaemon", "WaitMsBeforeAsync", "toolSummary", "Cwd", "cwd"]);
+const FILE_KEYS = new Set(["Path", "path", "file_path", "filePath", "StartLine", "EndLine", "ByteOffset"]);
+
+export type ToolCallMeta = {
+  title?: string;
+  kind?: string;
+  rawInput?: unknown;
+  locations?: unknown[];
+};
+
+const object = (value: unknown): Fields | undefined =>
+  value && typeof value === "object" && !Array.isArray(value) ? (value as Fields) : undefined;
+
+const cleanControl = (value: string): string => value.replace(/[\u0000-\u001f\u007f]+/g, " ").trim();
+
+const isEmptyObject = (value: unknown): boolean => {
+  const obj = object(value);
+  return !!obj && Object.keys(obj).length === 0;
+};
+
+function mergeToolMeta(call: Fields | undefined, prev?: ToolCallMeta): ToolCallMeta {
+  const title = typeof call?.title === "string" && cleanControl(call.title) ? call.title : prev?.title;
+  const kind = typeof call?.kind === "string" && cleanControl(call.kind) ? call.kind : prev?.kind;
+  const keepPrevRaw = isEmptyObject(call?.rawInput) && prev?.rawInput !== undefined && !isEmptyObject(prev.rawInput);
+  const rawInput = call?.rawInput !== undefined && !keepPrevRaw ? call.rawInput : prev?.rawInput;
+  const locations = Array.isArray(call?.locations) && call.locations.length ? call.locations : prev?.locations;
+  return {
+    ...(title !== undefined ? { title } : {}),
+    ...(kind !== undefined ? { kind } : {}),
+    ...(rawInput !== undefined ? { rawInput } : {}),
+    ...(locations !== undefined ? { locations } : {}),
+  };
+}
+
+function capReason(text: string, suffix = `… [truncated: ${text.length} chars total]`): string {
+  if (text.length <= MAX_REASON) return text;
+  const keep = Math.max(0, MAX_REASON - suffix.length);
+  return `${text.slice(0, keep)}${suffix}`;
+}
+
+/** Builds a human- and Auto-Review-readable explanation from permission/tool-call metadata. */
+export function describePermission(toolName: string, call: Fields | undefined, prev?: ToolCallMeta): string {
+  const { title, kind, rawInput, locations } = mergeToolMeta(call, prev);
+  const inputObj = object(rawInput);
+
+  if (inputObj) {
+    const rawCmd = typeof inputObj.CommandLine === "string"
+      ? inputObj.CommandLine
+      : typeof inputObj.command === "string"
+        ? inputObj.command
+        : undefined;
+    if (rawCmd !== undefined && cleanControl(rawCmd).length > 0) {
+      const tags: string[] = [];
+      if (inputObj.BypassSandbox === true) tags.push("UNSANDBOXED, BypassSandbox: true");
+      else if (inputObj.BypassSandbox === false) tags.push("sandboxed");
+      if (inputObj.IsDaemon === true) tags.push("daemon");
+      const rawCwd = typeof inputObj.Cwd === "string"
+        ? inputObj.Cwd
+        : typeof inputObj.cwd === "string"
+          ? inputObj.cwd
+          : undefined;
+      const cwd = rawCwd ? cleanControl(rawCwd) : "";
+      const summary = typeof inputObj.toolSummary === "string" ? cleanControl(inputObj.toolSummary) : "";
+      const extraObj: Fields = {};
+      for (const [k, v] of Object.entries(inputObj)) {
+        if (!COMMAND_KEYS.has(k) && v !== undefined) extraObj[k] = v;
+      }
+      const extra = Object.keys(extraObj).length ? ` ${cleanControl(JSON.stringify(extraObj) ?? "")}` : "";
+      const prefix = `Antigravity wants to ${toolName}${tags.length ? ` [${tags.join(", ")}]` : ""}${cwd ? ` in ${cwd}` : ""}${summary ? ` (${summary})` : ""}: `;
+      const cmd = cleanControl(rawCmd);
+      const full = `${prefix}${cmd}${extra}`;
+      if (full.length <= MAX_REASON) return full;
+      const suffix = (prefix + cmd).length > MAX_REASON
+        ? `… [COMMAND TRUNCATED: ${rawCmd.length} chars total]`
+        : `… [truncated: ${full.length} chars total]`;
+      return capReason(full, suffix);
+    }
+
+    const rawPath = typeof inputObj.Path === "string"
+      ? inputObj.Path
+      : typeof inputObj.path === "string"
+        ? inputObj.path
+        : typeof inputObj.file_path === "string"
+          ? inputObj.file_path
+          : typeof inputObj.filePath === "string"
+            ? inputObj.filePath
+            : undefined;
+    const cleanedPath = rawPath ? cleanControl(rawPath) : "";
+    if (cleanedPath) {
+      const start = typeof inputObj.StartLine === "number" && Number.isFinite(inputObj.StartLine) ? inputObj.StartLine : undefined;
+      const end = typeof inputObj.EndLine === "number" && Number.isFinite(inputObj.EndLine) ? inputObj.EndLine : undefined;
+      const rangeNote = start !== undefined && end !== undefined
+        ? ` (lines ${start}-${end})`
+        : start !== undefined
+          ? ` (from line ${start})`
+          : end !== undefined
+            ? ` (to line ${end})`
+            : "";
+      const extraObj: Fields = {};
+      for (const [k, v] of Object.entries(inputObj)) {
+        if (!FILE_KEYS.has(k) && v !== undefined) extraObj[k] = v;
+      }
+      const extraNote = Object.keys(extraObj).length ? ` ${cleanControl(JSON.stringify(extraObj) ?? "")}` : "";
+      return capReason(`Antigravity wants to ${toolName} ${cleanedPath}${rangeNote}${extraNote}`);
+    }
+  }
+
+  const hasNonEmptyRaw = rawInput !== undefined && rawInput !== null && (
+    inputObj ? Object.keys(inputObj).length > 0
+      : Array.isArray(rawInput) ? rawInput.length > 0
+        : typeof rawInput === "string" ? cleanControl(rawInput).length > 0
+          : true
+  );
+  if (hasNonEmptyRaw) {
+    const serialized = typeof rawInput === "string" ? rawInput : (JSON.stringify(rawInput) ?? "");
+    const shown = cleanControl(serialized);
+    if (shown) {
+      const cleanedTitle = title ? cleanControl(title) : "";
+      const titleNote = cleanedTitle && cleanedTitle !== toolName ? ` (${cleanedTitle})` : "";
+      return capReason(`Antigravity wants to run ${toolName}${titleNote}: ${shown}`);
+    }
+  }
+
+  const cleanedTitle = title ? cleanControl(title) : "";
+  const distinctTitle = cleanedTitle && cleanedTitle !== toolName ? cleanedTitle : "";
+  const locPaths: string[] = [];
+  for (const loc of locations ?? []) {
+    const raw = typeof loc === "string"
+      ? loc
+      : typeof object(loc)?.path === "string"
+        ? (object(loc)!.path as string)
+        : undefined;
+    const p = raw ? cleanControl(raw) : "";
+    if (p && !locPaths.includes(p) && (!distinctTitle || !distinctTitle.includes(p))) locPaths.push(p);
+  }
+  const parts = [distinctTitle, ...locPaths].filter(Boolean);
+  const cleanedKind = kind ? cleanControl(kind) : "";
+  if (parts.length) {
+    return capReason(`Antigravity wants to run ${toolName}${cleanedKind ? ` (${cleanedKind})` : ""}: ${parts.join(" — ")}`);
+  }
+  return `Antigravity requested permission for ${toolName}${cleanedKind ? ` (${cleanedKind})` : ""}.`;
+}
+
+const PATH_KEYS = ["Path", "path", "file_path", "filePath", "DirectoryPath", "SearchPath"] as const;
+
+function extractPaths(meta: ToolCallMeta): string[] {
+  const seen = new Set<string>();
+  const add = (value: unknown) => {
+    if (typeof value !== "string") return;
+    const cleaned = cleanControl(value);
+    if (cleaned) seen.add(cleaned);
+  };
+  const inputObj = object(meta.rawInput);
+  if (inputObj) {
+    for (const key of PATH_KEYS) add(inputObj[key]);
+  }
+  for (const loc of meta.locations ?? []) {
+    if (typeof loc === "string") add(loc);
+    else add(object(loc)?.path);
+  }
+  return [...seen];
+}
+
+async function decidePermission(
+  params: Fields,
+  sessionId: SessionId,
+  signal: AbortSignal,
+  approve: GravityApproval,
+  rows?: ReturnType<typeof gravityToolRows>,
+  refused?: (toolName: string) => void,
+  log?: (message: string) => void,
+  toolMeta?: ReadonlyMap<string, ToolCallMeta>,
+  bridge?: McpGrant,
+  access?: string,
+  fullAccess = false,
+) {
   const call = object(params.toolCall);
   const callId = call?.toolCallId;
   const label = call?.name ?? call?.title;
   if (signal.aborted || typeof callId !== "string" || !callId || callId.length > 256 ||
       typeof label !== "string" || !Array.isArray(params.options)) return;
-  const toolName = label.replace(/[\u0000-\u001f\u007f]/g, " ").trim().slice(0, 160);
+  const toolName = cleanControl(label).slice(0, 160);
   if (!toolName) return;
   const options = params.options.map(object);
   const ids = new Set<string>();
@@ -117,17 +303,35 @@ async function decidePermission(params: Fields, sessionId: SessionId, signal: Ab
   const allow = options.filter((option) => option?.kind === "allow_once");
   const reject = options.filter((option) => option?.kind === "reject_once");
   if (allow.length !== 1 || reject.length > 1) return;
-  const response = await approve({ sessionId, callId: rows?.callId(callId) ?? callId, toolName, signal });
+  const dshCallId = rows?.callId(callId) ?? callId;
+  const kind = typeof call?.kind === "string" ? call.kind : undefined;
+  const effectiveKind = kind ?? toolMeta?.get(callId)?.kind;
+  if (fullAccess) {
+    log?.(`permission "${toolName}" (${effectiveKind ?? "?"}) → auto-allowed (danger-full-access)`);
+    return { outcome: { outcome: "selected", optionId: allow[0]!.optionId } };
+  }
+  const mcpTool = (effectiveKind === undefined || effectiveKind === "other") && toolName.startsWith("mcp_dsh_")
+    ? toolName.slice("mcp_dsh_".length)
+    : undefined;
+  if (mcpTool && bridge?.ownsTool?.(mcpTool)) {
+    log?.(`permission "${toolName}" (${effectiveKind ?? "?"}) → deferred to DSH tool bridge`);
+    return { outcome: { outcome: "selected", optionId: allow[0]!.optionId } };
+  }
+  const merged = mergeToolMeta(call, toolMeta?.get(callId));
+  const paths = extractPaths(merged);
+  if (isAutoAllowedRead(access, toolName, effectiveKind, paths)) {
+    log?.(`permission "${toolName}" (read) → auto-allowed (${access} read)`);
+    return { outcome: { outcome: "selected", optionId: allow[0]!.optionId } };
+  }
+  const reason = describePermission(toolName, call, toolMeta?.get(callId));
+  const response = await approve({ sessionId, callId: dshCallId, toolName, reason, signal });
   if (signal.aborted) return;
-  log?.(`permission "${toolName}" (${typeof call?.kind === "string" ? call.kind : "?"}) → DSH ${response}`);
+  log?.(`permission "${toolName}" (${kind ?? "?"}) → DSH ${response}`);
   if (response !== "allowed-once") refused?.(toolName);
   const optionId = (response === "allowed-once" ? allow[0] : response === "rejected" ? reject[0] : undefined)?.optionId;
   if (typeof optionId !== "string") return;
   return { outcome: { outcome: "selected", optionId } };
 }
-
-const object = (value: unknown): Fields | undefined =>
-  value && typeof value === "object" && !Array.isArray(value) ? (value as Fields) : undefined;
 
 const count = (value: unknown): number | undefined =>
   typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
@@ -173,7 +377,7 @@ export class GravityAdapter extends LlmAdapter {
     private readonly approve?: GravityApproval,
     private readonly resume?: ResumeMap,
     private readonly toolRows?: (id: SessionId, model: string) => ReturnType<typeof gravityToolRows>,
-    private readonly mcp?: (sessionId: string) => Promise<{ config: McpServerConfig; revoke(): void } | undefined>,
+    private readonly mcp?: (sessionId: string) => Promise<McpGrant | undefined>,
   ) {
     super();
   }
@@ -338,19 +542,21 @@ export class GravityAdapter extends LlmAdapter {
     };
   }
 
-  private open(cwd: string): Session {
-    const connection = new AgyConnection({ ...this.launch, cwd, timeoutMs: 15_000 }, (method, params) => {
+  private open(cwd: string, fullAccess = false): Session {
+    const args = fullAccess && this.launch.fullAccessArgs ? this.launch.fullAccessArgs : this.launch.args;
+    const connection = new AgyConnection({ ...this.launch, args, cwd, timeoutMs: 15_000 }, (method, params) => {
       if (!session.id || params.sessionId !== session.id) return;
       if (method === "session/update") session.update?.(params.update);
       if (method === "session/request_permission") return session.permission?.(params);
     });
-    const session: Session = { connection, cwd, busy: false, lastUsed: Date.now() };
+    const session: Session = { connection, cwd, fullAccess, busy: false, lastUsed: Date.now() };
     this.living.add(session);
     return session;
   }
 
   private async release(session: Session): Promise<void> {
     session.revokeMcp?.();
+    session.mcpBridge = undefined;
     try {
       await session.connection.close();
     } finally {
@@ -380,12 +586,18 @@ export class GravityAdapter extends LlmAdapter {
     const cwd = this.cwdFor(options.sessionId);
     if (!cwd) throw new Error("Oh My Gravity requires a DSH workspace directory");
     const key = options.purpose ? undefined : options.sessionId;
+    const access = accessModeOf(options.messages);
+    const wantFullAccess = !!key && access === "danger-full-access" && !!this.launch.fullAccessArgs;
     let session = key ? this.sessions.get(key) : undefined;
     if (session?.busy) throw new Error("An Antigravity turn is already running in this session");
-    if (session && (session.cwd !== cwd || session.connection.closed)) {
-      if (key) this.sessions.delete(key);
-      // Begin teardown synchronously; never yield the session reservation to a concurrent caller.
-      void this.release(session);
+    if (session && (session.cwd !== cwd || session.fullAccess !== wantFullAccess || session.connection.closed)) {
+      session.busy = true;
+      session.retired = true;
+      try {
+        await this.release(session);
+      } finally {
+        if (key && this.sessions.get(key) === session) this.sessions.delete(key);
+      }
       session = undefined;
     }
     const recent = options.messages.slice(options.messages.findLastIndex((m) => m.role === "assistant") + 1);
@@ -402,7 +614,7 @@ export class GravityAdapter extends LlmAdapter {
     options.signal?.throwIfAborted();
     if (!session) {
       this.makeRoom();
-      session = this.open(cwd);
+      session = this.open(cwd, wantFullAccess);
       if (!this.reaper) {
         this.reaper = setInterval(() => this.reap(), this.launch.reapEveryMs ?? 60_000);
         this.reaper.unref();
@@ -433,6 +645,7 @@ export class GravityAdapter extends LlmAdapter {
         if (init?.protocolVersion !== 1) throw new Error("Antigravity did not negotiate ACP version 1");
         const grant = key ? await this.mcp?.(key) : undefined;
         session.revokeMcp = grant?.revoke;
+        session.mcpBridge = grant;
         const mcpServers = grant ? [grant.config] : [];
         const saved = key ? this.resume?.get(key) : undefined;
         let created: Fields | undefined;
@@ -461,16 +674,19 @@ export class GravityAdapter extends LlmAdapter {
         session.defaultModel = session.model = current;
       }
       // DSH's access mode decides how much AGY may do on its own; with none stated, AGY's own default.
-      const access = accessModeOf(options.messages);
       if (key) this.access.set(key, access);
-      const wantedMode = (access && MODE_FOR_ACCESS[access]) || session.defaultMode;
+      const wantedMode = session.fullAccess ? undefined : ((access && MODE_FOR_ACCESS[access]) || session.defaultMode);
       // Only changes are logged, so the journal shows what DSH told AGY without a line per turn.
-      const seen = access ?? "none";
+      const seen = session.fullAccess ? `${access}:full` : (access ?? "none");
       if (key && this.lastLogged.get(key) !== `${seen}`) {
         this.lastLogged.set(key, seen);
-        this.launch.log?.(access ? `session …${key.slice(-8)}: DSH access ${access} → AGY mode ${wantedMode ?? "(AGY default)"}` : `session …${key.slice(-8)}: no DSH access mode in the request; AGY stays on its default mode`);
+        this.launch.log?.(session.fullAccess
+          ? `session …${key.slice(-8)}: DSH access ${access} → AGY --dangerously-skip-permissions`
+          : access
+            ? `session …${key.slice(-8)}: DSH access ${access} → AGY mode ${wantedMode ?? "(AGY default)"}`
+            : `session …${key.slice(-8)}: no DSH access mode in the request; AGY stays on its default mode`);
       }
-      if (wantedMode && wantedMode !== session.mode) {
+      if (!session.fullAccess && wantedMode && wantedMode !== session.mode) {
         if (!session.modes?.has(wantedMode)) throw new Error(`Antigravity does not offer mode ${wantedMode}, which DSH's ${access ?? "default"} access needs`);
         await conn.request("session/set_mode", { sessionId: session.id, modeId: wantedMode });
         session.mode = wantedMode;
@@ -488,6 +704,7 @@ export class GravityAdapter extends LlmAdapter {
       }
       options.signal?.throwIfAborted();
       rows = key ? this.toolRows?.(key, options.model) : undefined;
+      const toolMeta = new Map<string, ToolCallMeta>();
       const chunks: StreamChunk[] = [];
       let wake: (() => void) | undefined;
       let index = 0;
@@ -514,6 +731,15 @@ export class GravityAdapter extends LlmAdapter {
         }
         if (kind === "tool_call" || kind === "tool_call_update") {
           rows?.update(update);
+          const id = update?.toolCallId;
+          if (typeof id === "string" && id && id.length <= 256) {
+            if (update?.status === "completed" || update?.status === "failed") {
+              toolMeta.delete(id);
+            } else {
+              const prev = toolMeta.get(id);
+              if (prev || toolMeta.size < 256) toolMeta.set(id, mergeToolMeta(update, prev));
+            }
+          }
           return;
         }
         const type = kind === "agent_message_chunk" ? "text" : kind === "agent_thought_chunk" ? "reasoning" : undefined;
@@ -537,8 +763,20 @@ export class GravityAdapter extends LlmAdapter {
       };
       const approval = this.approve;
       if (key && approval) {
-        session.permission = (params) => decidePermission(params, key, approvalLifetime.signal, approval, rows, (tool) => { refusedTool ??= tool; },
-          this.launch.log);
+        const fullAccess = session.fullAccess;
+        session.permission = (params) => decidePermission(
+          params,
+          key,
+          approvalLifetime.signal,
+          approval,
+          rows,
+          (tool) => { refusedTool ??= tool; },
+          this.launch.log,
+          toolMeta,
+          session.mcpBridge,
+          access,
+          fullAccess,
+        );
       }
       void conn.request("session/prompt", {
         sessionId: session.id,

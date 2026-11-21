@@ -108,13 +108,16 @@ try {
   console.log(JSON.stringify(rows));
   assert.ok(summary.usage && summary.usage.inputTokens + summary.usage.outputTokens > 0, 'usage chunk must carry input and output tokens');
   if (checkingApproval) {
-    assert.ok(answers.length > 0 && answers.every(({ exactSession }) => exactSession), 'the approval must belong to the smoke session');
-    assert.ok(asked.length === answers.length && decided.length === answers.length && rows.denial, 'each AGY permission request must be answered as the mode dictates');
-    assert.ok(calls.length > 0 && calls.length === results.length && rows.correlated, 'AGY tool activity must be recorded as correlated DSH rows');
+    assert.ok(calls.length > 0 && calls.length === results.length, 'AGY tool activity must be recorded as correlated DSH rows');
     if (bridging) {
       assert.deepEqual(executed, [true], 'the DSH tool must run exactly once, for this session\'s agent');
       assert.ok(reply.includes(marker), 'AGY must relay the DSH tool result');
-    } else assert.ok(rows.markerAbsent, 'the rejected read must not leak the fixture contents');
+    } else {
+      assert.ok(answers.length > 0 && answers.every(({ exactSession }) => exactSession), 'the approval must belong to the smoke session');
+      assert.ok(asked.length === answers.length && decided.length === answers.length && rows.denial, 'each AGY permission request must be answered as the mode dictates');
+      assert.ok(rows.correlated, 'AGY tool activity must correlate with approval rows');
+      assert.ok(rows.markerAbsent, 'the rejected read must not leak the fixture contents');
+    }
     const restored = Session.create(SessionId(id), events, session.header);
     assert.ok(restored.snapshotEvents().length >= events.length, 'restore must keep every recorded event');
   } else {

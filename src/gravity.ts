@@ -1,6 +1,5 @@
 import { execFile } from "node:child_process";
 import type { IncomingMessage, ServerResponse } from "node:http";
-import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { delimiter, isAbsolute, join } from "node:path";
 import z from "@deepseek-ai/schemastery";
@@ -16,8 +15,6 @@ import { agyEnv } from "./gravity-env.js";
 
 export const name = "dsh-oh-my-gravity";
 export const inject = ["llm", "sessions", "connection"];
-/** Longest argument text an approval prompt may carry; larger calls are refused rather than truncated. */
-const MAX_SHOWN_ARGS = 4000;
 export const Config = z.object({
   command: z.string().default("agy").description("Path to your signed-in Antigravity CLI."),
   idleMinutes: z.number().min(1).default(30).description("Stop a session's Antigravity process (about 240 MB) after this many idle minutes; it resumes on the next message."),
@@ -50,27 +47,32 @@ export const apply = (ctx: GravityContext, config: Schemastery.TypeT<typeof Conf
   let bridge: Promise<ToolBridge | undefined> | undefined;
   const toolBridge = () => bridge ??= (async () => {
     const tools = ctx.get?.("tools");
-    return tools && startToolBridge(tools, (id) => ctx.get?.("agents")?.get(id as never), async (id, tool, args, signal) => {
-      const agent = ctx.get?.("agents")?.get(id as never);
-      const approval = ctx.get?.("approval");
-      if (!agent?.session || agent.session !== ctx.sessions.get(id as never) || !approval || signal.aborted) return "unavailable";
-      // The person approves exactly what runs: arguments are shown whole, and a call too big to show is refused, never cut.
-      const shown = JSON.stringify(args) ?? "";
-      if (shown.length > MAX_SHOWN_ARGS) return "rejected";
-      return approval.request({ agent, callId: randomUUID(), toolName: `mcp_dsh_${tool}`, reason: `Antigravity wants to run the DSH tool ${tool} with arguments ${shown}`, signal });
-    }, (id, tool) => readOnlyRefusal(adapter.accessOf(id), tool));
+    return tools && startToolBridge(
+      tools,
+      (id) => ctx.get?.("agents")?.get(id as never),
+      (id, tool) => readOnlyRefusal(adapter.accessOf(id), tool),
+    );
   })().catch(() => undefined);
   const settings = fileSettings();
-  const adapter = new GravityAdapter({ command: config.command, args: ["acp", "--sandbox"], env, models: config.models, idleMs: config.idleMinutes * 60_000, maxProcesses: config.maxProcesses, hidden: () => settings.get().hiddenModels,
+  const adapter = new GravityAdapter({
+    command: config.command,
+    args: ["acp", "--sandbox"],
+    fullAccessArgs: ["acp", "--dangerously-skip-permissions"],
+    env,
+    models: config.models,
+    idleMs: config.idleMinutes * 60_000,
+    maxProcesses: config.maxProcesses,
+    hidden: () => settings.get().hiddenModels,
     catalogFile: join(process.env.DSH_GRAVITY_STATE_DIR || join(homedir(), ".local", "state", "dsh-oh-my-gravity"), "catalog.json"),
-    log: (message) => console.warn(`[dsh-oh-my-gravity] ${message}`) }, (id) => {
+    log: (message) => console.warn(`[dsh-oh-my-gravity] ${message}`),
+  }, (id) => {
     const cwd = id && ctx.sessions.get(id)?.header.cwd;
     return cwd && isAbsolute(cwd) ? cwd : undefined;
-  }, async ({ sessionId, callId, toolName, signal }) => {
+  }, async ({ sessionId, callId, toolName, reason, signal }) => {
     const agent = ctx.get?.("agents")?.get(sessionId);
     const approval = ctx.get?.("approval");
     if (!agent?.session || agent.session !== ctx.sessions.get(sessionId) || !approval || signal.aborted) return "unavailable";
-    return approval.request({ agent, callId, toolName, signal });
+    return approval.request({ agent, callId, toolName, reason, signal });
   }, fileResumeMap(), (id, model) => {
     const session = ctx.sessions.get(id);
     return session && gravityToolRows(session, GRAVITY_PROVIDER, model);

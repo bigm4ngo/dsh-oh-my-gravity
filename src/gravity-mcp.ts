@@ -1,8 +1,7 @@
-import { randomBytes, timingSafeEqual } from "node:crypto";
+import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
-import { randomUUID } from "node:crypto";
-import type { Agent, ApprovalOutcome, DshToolsRegistry, JsonValue } from "./dsh.js";
+import type { Agent, DshToolsRegistry, JsonValue } from "./dsh.js";
 
 export const KEY_HEADER = "x-gravity-key";
 const BODY_LIMIT = 1024 * 1024;
@@ -15,10 +14,15 @@ export interface McpServerConfig {
   url: string;
   headers: { name: string; value: string }[];
 }
+export interface ToolGrant {
+  config: McpServerConfig;
+  revoke(): void;
+  ownsTool(tool: string): boolean;
+}
 export interface ToolBridge {
   url: string;
   /** A per-session credential: AGY gets the config, and calls reach only that session's agent. */
-  issue(sessionId: string): { config: McpServerConfig; revoke(): void};
+  issue(sessionId: string): ToolGrant;
   close(): Promise<void>;
 }
 
@@ -28,14 +32,11 @@ const record = (v: unknown): Record<string, JsonValue> | undefined =>
 
 const same = (a: string, b: string) => a.length === b.length && timingSafeEqual(Buffer.from(a), Buffer.from(b));
 
-export type BridgeApproval = (sessionId: string, tool: string, args: Record<string, JsonValue>, signal: AbortSignal) => Promise<ApprovalOutcome>;
-
-/** Serves the DSH tools an agent can see to AGY over MCP Streamable HTTP on loopback. Tools run
- *  here, inside DSH; AGY asks DSH's approval for each call before it reaches this server. */
+/** Serves the DSH tools an agent can see to AGY over MCP Streamable HTTP on loopback.
+ *  Tools enforce their own permissions inside DSH; the adapter enforces the read-only plan gate. */
 export async function startToolBridge(
   tools: Pick<DshToolsRegistry, "schemas" | "get">,
   agentFor: (sessionId: string) => Agent | undefined,
-  approve: BridgeApproval,
   /** A reason this tool may not run in this session right now (DSH has it read-only), or undefined. */
   refuse: (sessionId: string, tool: string) => string | undefined = () => undefined,
 ): Promise<ToolBridge> {
@@ -61,6 +62,7 @@ export async function startToolBridge(
     const key = typeof presented === "string" ? presented : "";
     const granted = [...grants].find(([k]) => same(k, key));
     if (!granted) return send(res, 401);
+    const sessionId = granted[1];
     if (req.method !== "POST") return send(res, 405);
     const raw = await readBody(req);
     if (raw === undefined) {
@@ -72,7 +74,7 @@ export async function startToolBridge(
     if (!msg || typeof msg !== "object" || msg.id === undefined) return send(res, 202); // notifications need no reply
     const reply = (result: object) => send(res, 200, { jsonrpc: "2.0", id: msg.id, result });
     const fail = (code: number, message: string) => send(res, 200, { jsonrpc: "2.0", id: msg.id, error: { code, message } });
-    const agent = agentFor(granted[1]);
+    const agent = agentFor(sessionId);
     const params = record(msg.params);
     switch (msg.method) {
       case "initialize":
@@ -96,14 +98,10 @@ export async function startToolBridge(
         const tool = HIDDEN.has(name) ? undefined : tools.get(name, agent);
         const failed = (text: string) => reply({ isError: true, content: [{ type: "text", text }] });
         if (!tool) return failed(`unknown tool ${name}`);
-        const barred = refuse(granted[1], name);
+        const barred = refuse(sessionId, name);
         if (barred) return failed(barred);
-        // DSH's approval is enforced here, not left to AGY: AGY's own settings may allow MCP calls unasked.
         const abort = new AbortController();
         res.once("close", () => { if (!res.writableEnded) abort.abort(); });
-        let outcome: ApprovalOutcome = "unavailable";
-        try { outcome = await approve(granted[1], name, args, abort.signal); } catch { /* cannot ask: fail closed */ }
-        if (outcome !== "allowed-once") return failed(`${name} was not approved (${outcome})`);
         try {
           const exec = { agent, signal: abort.signal, name, arguments: args, callId: randomUUID() };
           const returned = await tool.execute(args, exec);
@@ -129,8 +127,20 @@ export async function startToolBridge(
     issue(sessionId) {
       const key = randomBytes(32).toString("hex");
       grants.set(key, sessionId);
-      return { config: { type: "http", name: "dsh", url, headers: [{ name: KEY_HEADER, value: key }] }, revoke: () => { grants.delete(key); } };
+      return {
+        config: { type: "http", name: "dsh", url, headers: [{ name: KEY_HEADER, value: key }] },
+        revoke: () => { grants.delete(key); },
+        ownsTool: (tool: string) => {
+          if (!grants.has(key) || HIDDEN.has(tool)) return false;
+          const agent = agentFor(sessionId);
+          return !!agent && !!tools.get(tool, agent);
+        },
+      };
     },
-    close: () => new Promise<void>((resolve) => { grants.clear(); server.close(() => resolve()); server.closeAllConnections(); }),
+    close: () => new Promise<void>((resolve) => {
+      grants.clear();
+      server.close(() => resolve());
+      server.closeAllConnections();
+    }),
   };
 }

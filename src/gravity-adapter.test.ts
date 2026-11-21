@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createUserMessage, type GenerateOptions } from "@deepseek-ai/dsh-llm";
-import { GravityAdapter } from "./gravity-adapter.js";
+import { describePermission, GravityAdapter } from "./gravity-adapter.js";
 import type { ApprovalOutcome } from "./dsh.js";
 
 // Real stdio transport. The child checks that the adapter uses the intended wire requests.
@@ -81,8 +81,8 @@ require('node:readline').createInterface({input:process.stdin}).on('line', line 
 });`;
 const requests: unknown[] = [];
 let outcome: ApprovalOutcome = 'allowed-once';
-const permissions = new GravityAdapter({ command: process.execPath, args: ['-e', permissionFixture], env: process.env }, () => process.cwd(), async (request: { callId: string; toolName: string; sessionId: string; signal: AbortSignal }) => {
-  requests.push([request.sessionId, request.callId, request.toolName, request.signal.aborted]);
+const permissions = new GravityAdapter({ command: process.execPath, args: ['-e', permissionFixture], env: process.env }, () => process.cwd(), async (request: { callId: string; toolName: string; reason: string; sessionId: string; signal: AbortSignal }) => {
+  requests.push([request.sessionId, request.callId, request.toolName, request.signal.aborted, request.reason]);
   return outcome;
 });
 try {
@@ -96,10 +96,160 @@ try {
       { type: 'finish', reason: { kind: 'stop' } },
     ]);
   }
-  assert.deepEqual(requests, Array.from({ length: 3 }, () => ['same', 'call-1', 'Read synthetic fixture', false]));
+  assert.deepEqual(requests, Array.from({ length: 3 }, () => ['same', 'call-1', 'Read synthetic fixture', false, 'Antigravity requested permission for Read synthetic fixture (read).']));
 } finally {
   await permissions.close();
 }
+
+// describePermission preserves command flags/summaries, file line ranges, size bounds, and sanitization.
+const cmdReason = describePermission("run_command", {
+  name: "run_command",
+  kind: "execute",
+  rawInput: { CommandLine: "git push origin main", BypassSandbox: true, toolSummary: "Push branch" },
+});
+assert.match(cmdReason, /UNSANDBOXED, BypassSandbox: true/);
+assert.match(cmdReason, /Push branch/);
+assert.match(cmdReason, /git push origin main/);
+
+const fileReason = describePermission("read_file", {
+  name: "read_file",
+  kind: "read",
+  rawInput: { Path: "/tmp/example.ts", StartLine: 10, EndLine: 45 },
+});
+assert.equal(fileReason, "Antigravity wants to read_file /tmp/example.ts (lines 10-45)");
+
+const hugeCmd = "x".repeat(5000);
+const cappedReason = describePermission("run_command", {
+  name: "run_command",
+  rawInput: { CommandLine: hugeCmd },
+});
+assert.ok(cappedReason.length <= 4000, `length=${cappedReason.length}`);
+assert.match(cappedReason, /COMMAND TRUNCATED: 5000 chars total/);
+
+const dirtyReason = describePermission("run_command", {
+  name: "run_command",
+  title: "Run\x1b[31m\nCmd\0",
+  rawInput: { CommandLine: "echo\nhi\x1b[0m\0" },
+});
+assert.equal(/[\u0000-\u001f\u007f]/.test(dirtyReason), false);
+assert.match(dirtyReason, /echo hi \[0m/);
+
+// End-to-end: rawInput sent on an earlier tool_call update survives into a stripped session/request_permission ask.
+const metaFixture = String.raw`
+const send = m => console.log(JSON.stringify({jsonrpc:'2.0',...m}));
+let prompt;
+let step = 0;
+require('node:readline').createInterface({input:process.stdin}).on('line', line => {
+  const m = JSON.parse(line);
+  if (m.method === 'initialize') return send({id:m.id,result:{protocolVersion:1}});
+  if (m.method === 'session/new') return send({id:m.id,result:{sessionId:'fixture'}});
+  if (m.method === 'session/prompt') {
+    prompt = m;
+    send({ method: 'session/update', params: { sessionId: 'fixture', update: {
+      sessionUpdate: 'tool_call', toolCallId: 'cmd-1', name: 'run_command', kind: 'execute',
+      rawInput: { CommandLine: 'npm publish', BypassSandbox: true, toolSummary: 'Publish package' },
+    } } });
+    return send({ id: 'ask-1', method: 'session/request_permission', params: {
+      sessionId: 'fixture',
+      toolCall: { toolCallId: 'cmd-1', name: 'run_command', kind: 'execute' },
+      options: [{ kind: 'allow_once', optionId: 'yes' }],
+    } });
+  }
+  if (m.id === 'ask-1') {
+    step++;
+    return send({ id: 'ask-2', method: 'session/request_permission', params: {
+      sessionId: 'fixture',
+      toolCall: { toolCallId: 'cmd-2', name: 'run_command', kind: 'execute', rawInput: { CommandLine: 'ls -la', BypassSandbox: false } },
+      options: [{ kind: 'allow_once', optionId: 'yes' }],
+    } });
+  }
+  if (m.id === 'ask-2' && step === 1) return send({ id: prompt.id, result: { stopReason: 'end_turn' } });
+});`;
+const seenReasons: Array<{ toolName: string; reason: string }> = [];
+const metaAdapter = new GravityAdapter(
+  { command: process.execPath, args: ['-e', metaFixture], env: process.env },
+  () => process.cwd(),
+  async (request) => {
+    seenReasons.push({ toolName: request.toolName, reason: request.reason });
+    return 'allowed-once';
+  },
+);
+try {
+  await collect(metaAdapter.stream(options('go')));
+} finally {
+  await metaAdapter.close();
+}
+assert.equal(seenReasons.length, 2);
+assert.match(seenReasons[0]!.reason, /UNSANDBOXED, BypassSandbox: true/);
+assert.match(seenReasons[0]!.reason, /Publish package/);
+assert.match(seenReasons[0]!.reason, /npm publish/);
+assert.match(seenReasons[1]!.reason, /\[sandboxed\].*: ls -la/);
+
+// End-to-end: ordinary outside reads auto-allow in workspace-write; sensitive reads & outside edits still ask; danger-full-access auto-allows all.
+const policyFixture = String.raw`
+const tag = process.argv[1];
+const send = m => console.log(JSON.stringify({jsonrpc:'2.0',...m}));
+let prompt;
+let step = 0;
+const asks = [
+  { id: 'r1', toolCall: { toolCallId: 't1', name: 'read_file', kind: 'read', rawInput: { Path: '/home/euro/other/file.ts' } } },
+  { id: 'r2', toolCall: { toolCallId: 't2', name: 'read_file', kind: 'read', rawInput: { Path: '/home/euro/.ssh/id_rsa' } } },
+  { id: 'r3', toolCall: { toolCallId: 't3', name: 'edit_file', kind: 'edit', rawInput: { Path: '/home/euro/other/file.ts' } } },
+];
+function nextAsk() {
+  const a = asks[step++];
+  if (!a) return send({ id: prompt.id, result: { stopReason: 'end_turn' } });
+  return send({ id: a.id, method: 'session/request_permission', params: {
+    sessionId: 'fixture',
+    toolCall: a.toolCall,
+    options: [{ kind: 'allow_once', optionId: 'yes' }, { kind: 'reject_once', optionId: 'no' }],
+  } });
+}
+require('node:readline').createInterface({input:process.stdin}).on('line', line => {
+  const m = JSON.parse(line);
+  if (m.method === 'initialize') return send({id:m.id,result:{protocolVersion:1}});
+  if (m.method === 'session/new') return send({id:m.id,result:{sessionId:'fixture',modes:{currentModeId:'default',availableModes:[{id:'default'},{id:'auto'},{id:'plan'}]}}});
+  if (m.method === 'session/set_mode') return send({id:m.id,result:{}});
+  if (m.method === 'session/prompt') { prompt = m; step = 0; return nextAsk(); }
+  if (m.id === 'r1' || m.id === 'r2' || m.id === 'r3') {
+    if (m.result?.outcome?.optionId !== 'yes') process.exit(5);
+    return nextAsk();
+  }
+});`;
+const policyNote = (access: string) => createUserMessage({
+  content: [{ type: 'text', text: `Current DSH file policy: ${access}.` }],
+  source: { kind: 'runtime-context', form: 'snapshot', sections: [{ name: 'sandbox:policy', text: `Current DSH file policy: ${access}.` }] },
+} as never);
+const promptedTools: Array<{ toolName: string; reason: string }> = [];
+const policyAdapter = new GravityAdapter(
+  { command: process.execPath, args: ['-e', policyFixture, 'sandbox'], fullAccessArgs: ['-e', policyFixture, 'full'], env: process.env },
+  () => process.cwd(),
+  async (request) => {
+    promptedTools.push({ toolName: request.toolName, reason: request.reason });
+    return 'allowed-once';
+  },
+);
+try {
+  await collect(policyAdapter.stream({
+    ...options('run1', 'policy-s'),
+    messages: [policyNote('workspace-write'), createUserMessage({ content: [{ type: 'text', text: 'run1' }], source: { kind: 'user' } })],
+  }));
+  assert.equal(promptedTools.length, 2);
+  assert.equal(promptedTools[0]!.toolName, 'read_file');
+  assert.match(promptedTools[0]!.reason, /\/home\/euro\/\.ssh\/id_rsa/);
+  assert.equal(promptedTools[1]!.toolName, 'edit_file');
+  assert.match(promptedTools[1]!.reason, /\/home\/euro\/other\/file\.ts/);
+
+  promptedTools.length = 0;
+  await collect(policyAdapter.stream({
+    ...options('run2', 'policy-s'),
+    messages: [policyNote('danger-full-access'), createUserMessage({ content: [{ type: 'text', text: 'run2' }], source: { kind: 'user' } })],
+  }));
+  assert.equal(promptedTools.length, 0);
+} finally {
+  await policyAdapter.close();
+}
+
 // The journal gets one line per relayed request: what AGY asked, and who answered.
 const lines: string[] = [];
 const logged = new GravityAdapter({ command: process.execPath, args: ['-e', permissionFixture], env: process.env, log: (m: string) => lines.push(m) }, () => process.cwd(), async () => (outcome));

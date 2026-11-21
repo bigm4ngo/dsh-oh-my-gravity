@@ -1,11 +1,41 @@
 import type { GenerateOptions } from "@deepseek-ai/dsh-llm";
+import { posix } from "node:path";
 
-/** DSH's access mode is AGY's session mode: read-only plans, workspace-write accepts edits in the workspace, full access runs auto. */
+/** DSH's access mode is AGY's session mode: read-only plans, workspace-write runs auto inside `agy acp --sandbox`, and danger-full-access uses `--dangerously-skip-permissions` when configured. */
 export const MODE_FOR_ACCESS: Readonly<Record<string, string>> = {
   "read-only": "plan",
-  "workspace-write": "accept-edits",
+  "workspace-write": "auto",
   "danger-full-access": "auto",
 };
+
+export const READ_ONLY_AGY_TOOLS: ReadonlySet<string> = new Set([
+  "read_file", "list_dir", "view_file", "view_file_outline", "view_code_item", "grep_search", "find_by_name",
+]);
+
+const SENSITIVE_READ_PATH =
+  /(?:^|\/)(?:\.ssh|\.aws|\.gnupg|\.kube|\.password-store|\.netrc|\.npmrc|\.pypirc|\.docker\/config\.json|id_rsa|id_ed25519|id_ecdsa|etc\/shadow|\.env(?:\.(?!example(?:\/|$)|sample(?:\/|$)|template(?:\/|$))[^/]*)?)(?:\/|$)/;
+
+function isSensitiveReadPath(rawPath: string): boolean {
+  const slashed = rawPath.replace(/\\/g, "/");
+  const normalized = posix.normalize(slashed);
+  return SENSITIVE_READ_PATH.test(slashed) || SENSITIVE_READ_PATH.test(normalized);
+}
+
+/**
+ * In `read-only` and `workspace-write`, ordinary reads outside the workspace match native DSH
+ * and are auto-allowed unless any target path touches sensitive credential/key locations.
+ */
+export function isAutoAllowedRead(
+  access: string | undefined,
+  toolName: string,
+  kind: string | undefined,
+  paths: readonly string[],
+): boolean {
+  if (access !== "read-only" && access !== "workspace-write") return false;
+  if (kind !== "read" || !READ_ONLY_AGY_TOOLS.has(toolName)) return false;
+  if (paths.length === 0) return false;
+  return paths.every((p) => !isSensitiveReadPath(p));
+}
 
 /**
  * DSH's access mode, from the runtime-context message DSH injects each turn: the `sandbox:policy` section of its structured

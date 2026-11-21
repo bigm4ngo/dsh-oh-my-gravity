@@ -9,6 +9,8 @@ type ConnectionOptions = ConstructorParameters<typeof AgyConnection>[0];
 type LaunchOptions = Omit<ConnectionOptions, "cwd" | "timeoutMs"> & {
     models?: readonly string[];
     hidden?: () => readonly string[];
+    /** Launch args used when DSH access is `danger-full-access` (e.g. `["acp", "--dangerously-skip-permissions"]`). */
+    fullAccessArgs?: readonly string[];
     /** Where the last good model list is kept, so a restart or a failed AGY start still shows models. */
     catalogFile?: string;
     /** How long a model list counts as fresh; a stale one is still answered at once and refreshed behind. */
@@ -21,6 +23,12 @@ type LaunchOptions = Omit<ConnectionOptions, "cwd" | "timeoutMs"> & {
     maxProcesses?: number;
     log?: (message: string) => void;
 };
+type Fields = Record<string, unknown>;
+type McpGrant = {
+    config: McpServerConfig;
+    revoke(): void;
+    ownsTool?: (tool: string) => boolean;
+};
 type Catalog = {
     id: string;
     name: string;
@@ -31,8 +39,17 @@ export type GravityApproval = (request: {
     sessionId: SessionId;
     callId: string;
     toolName: string;
+    reason: string;
     signal: AbortSignal;
 }) => Promise<ApprovalOutcome>;
+export type ToolCallMeta = {
+    title?: string;
+    kind?: string;
+    rawInput?: unknown;
+    locations?: unknown[];
+};
+/** Builds a human- and Auto-Review-readable explanation from permission/tool-call metadata. */
+export declare function describePermission(toolName: string, call: Fields | undefined, prev?: ToolCallMeta): string;
 export declare const GRAVITY_PROVIDER = "antigravity";
 /** ACP-backed provider. AGY owns execution; only explicit, one-time host approvals are relayed. */
 export declare class GravityAdapter extends LlmAdapter {
@@ -51,10 +68,7 @@ export declare class GravityAdapter extends LlmAdapter {
     /** Context windows AGY reported during turns, by model id (and by its level-free id). shortcut: not kept across restarts; the family table covers that. */
     private readonly contexts;
     private catalog?;
-    constructor(launch: LaunchOptions, cwdFor: (sessionId: GenerateOptions["sessionId"]) => string | undefined, approve?: GravityApproval | undefined, resume?: ResumeMap | undefined, toolRows?: ((id: SessionId, model: string) => ReturnType<typeof gravityToolRows>) | undefined, mcp?: ((sessionId: string) => Promise<{
-        config: McpServerConfig;
-        revoke(): void;
-    } | undefined>) | undefined);
+    constructor(launch: LaunchOptions, cwdFor: (sessionId: GenerateOptions["sessionId"]) => string | undefined, approve?: GravityApproval | undefined, resume?: ResumeMap | undefined, toolRows?: ((id: SessionId, model: string) => ReturnType<typeof gravityToolRows>) | undefined, mcp?: ((sessionId: string) => Promise<McpGrant | undefined>) | undefined);
     providerInfo(provider: string): {
         id: string;
         name: string;

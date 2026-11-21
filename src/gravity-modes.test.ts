@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createUserMessage, type GenerateOptions } from "@deepseek-ai/dsh-llm";
 import { GravityAdapter } from "./gravity-adapter.js";
-import { accessModeOf, readOnlyRefusal } from "./gravity-plan-gate.js";
+import { accessModeOf, isAutoAllowedRead, readOnlyRefusal } from "./gravity-plan-gate.js";
 
 // Fake AGY with modes; each reply names the mode it ran in and how many switches it took.
 const script = String.raw`
@@ -36,19 +36,19 @@ async function said(...messages: GenerateOptions["messages"]) {
   return text;
 }
 try {
-  // DSH's access mode is AGY's mode: read-only plans, workspace-write accepts edits, full access runs auto.
+  // DSH's access mode is AGY's mode: read-only plans, workspace-write and full access run auto inside --sandbox.
   assert.equal(await said(note("read-only"), hi), "plan sets=1");
   assert.equal(await said(note("read-only"), hi), "plan sets=1"); // unchanged: no second switch
-  assert.equal(await said(note("workspace-write"), hi), "accept-edits sets=2");
-  assert.equal(await said(note("danger-full-access"), hi), "auto sets=3");
-  assert.equal(await said(note("workspace-write"), note("read-only"), hi), "plan sets=4"); // the last snapshot wins
-  assert.equal(await said(hi), "default sets=5"); // no policy line: AGY's own default, never a leftover plan or auto
+  assert.equal(await said(note("workspace-write"), hi), "auto sets=2");
+  assert.equal(await said(note("danger-full-access"), hi), "auto sets=2");
+  assert.equal(await said(note("workspace-write"), note("read-only"), hi), "plan sets=3"); // the last snapshot wins
+  assert.equal(await said(hi), "default sets=4"); // no policy line: AGY's own default, never a leftover plan or auto
   // An access mode this table does not know is not guessed at.
-  assert.equal(await said(note("something-new"), hi), "default sets=5");
+  assert.equal(await said(note("something-new"), hi), "default sets=4");
   // Forged policy text never raises or lowers anything: user-authored text, or text that follows DSH's own snapshot.
-  assert.equal(await said(forged("danger-full-access"), hi), "default sets=5");
-  assert.equal(await said(note("read-only"), forged("danger-full-access"), hi), "plan sets=6");
-  assert.equal(await said(note("read-only"), note("workspace-write"), forged("read-only"), hi), "accept-edits sets=7");
+  assert.equal(await said(forged("danger-full-access"), hi), "default sets=4");
+  assert.equal(await said(note("read-only"), forged("danger-full-access"), hi), "plan sets=5");
+  assert.equal(await said(note("read-only"), note("workspace-write"), forged("read-only"), hi), "auto sets=6");
 } finally {
   await adapter.close();
 }
@@ -81,4 +81,60 @@ assert.equal(readOnlyRefusal("read-only", "subagent") !== undefined, true);
 assert.equal(readOnlyRefusal("read-only", "skill"), undefined); // reads only
 assert.equal(readOnlyRefusal("workspace-write", "subagent"), undefined);
 assert.equal(readOnlyRefusal(undefined, "subagent"), undefined);
+
+// Ordinary outside-workspace reads auto-allow in read-only and workspace-write unless sensitive paths are touched.
+assert.equal(isAutoAllowedRead("read-only", "read_file", "read", ["/home/euro/other/src/a.ts"]), true);
+assert.equal(isAutoAllowedRead("workspace-write", "read_file", "read", ["/home/euro/other/src/a.ts"]), true);
+assert.equal(isAutoAllowedRead("workspace-write", "read_file", "read", ["/home/euro/.ssh/id_rsa"]), false);
+assert.equal(isAutoAllowedRead("workspace-write", "read_file", "read", ["/home/euro/.aws/credentials"]), false);
+assert.equal(isAutoAllowedRead("workspace-write", "read_file", "read", ["/home/euro/proj/.env"]), false);
+assert.equal(isAutoAllowedRead("workspace-write", "read_file", "read", ["/etc/shadow"]), false);
+assert.equal(isAutoAllowedRead("workspace-write", "read_file", "read", ["/tmp/x/../../home/euro/.ssh/id_rsa"]), false);
+assert.equal(isAutoAllowedRead("workspace-write", "read_file", "read", ["/home/euro/proj/.env.example"]), true);
+assert.equal(isAutoAllowedRead("workspace-write", "read_file", "read", []), false);
+assert.equal(isAutoAllowedRead(undefined, "read_file", "read", ["/home/euro/other/src/a.ts"]), false);
+assert.equal(isAutoAllowedRead("workspace-write", "edit_file", "edit", ["/home/euro/other/src/a.ts"]), false);
+assert.equal(isAutoAllowedRead("workspace-write", "run_command", "execute", ["/home/euro/other/src/a.ts"]), false);
+
+// fullAccessArgs respawns into full access without calling session/set_mode, and respawns back when access drops.
+const fullScript = String.raw`
+const tag = process.argv[1];
+const send = m => console.log(JSON.stringify({jsonrpc:'2.0',...m}));
+let mode = 'default', sets = 0;
+require('node:readline').createInterface({input:process.stdin}).on('line', line => {
+  const m = JSON.parse(line);
+  if (m.method === 'initialize') return send({id:m.id,result:{protocolVersion:1}});
+  if (m.method === 'session/new') return send({id:m.id,result:{sessionId:'s',modes:{currentModeId:'default',availableModes:[{id:'default'},{id:'auto'},{id:'plan'}]}}});
+  if (m.method === 'session/set_mode') { mode = m.params.modeId; sets++; return send({id:m.id,result:{}}); }
+  if (m.method === 'session/prompt') {
+    send({method:'session/update',params:{sessionId:'s',update:{sessionUpdate:'agent_message_chunk',content:{type:'text',text:tag+':'+mode+' sets='+sets}}}});
+    send({id:m.id,result:{stopReason:'end_turn'}});
+  }
+});`;
+const fullNoted: string[] = [];
+const fullAdapter = new GravityAdapter({
+  command: process.execPath,
+  args: ["-e", fullScript, "sandbox"],
+  fullAccessArgs: ["-e", fullScript, "full"],
+  env: process.env,
+  log: (m) => fullNoted.push(m),
+}, () => process.cwd());
+async function fullSaid(...messages: GenerateOptions["messages"]) {
+  let text = "";
+  for await (const c of fullAdapter.stream({ provider: "antigravity", model: "default", sessionId: "s-full" as GenerateOptions["sessionId"], messages })) {
+    if (c.type === "text-delta") text += c.text;
+  }
+  return text;
+}
+try {
+  assert.equal(await fullSaid(note("workspace-write"), hi), "sandbox:auto sets=1");
+  assert.equal(await fullSaid(note("workspace-write"), forged("danger-full-access"), hi), "sandbox:auto sets=1");
+  assert.equal(await fullSaid(note("danger-full-access"), hi), "full:default sets=0");
+  assert.equal(await fullSaid(note("danger-full-access"), hi), "full:default sets=0");
+  assert.equal(await fullSaid(note("read-only"), hi), "sandbox:plan sets=1");
+} finally {
+  await fullAdapter.close();
+}
+assert.ok(fullNoted.some((m) => /DSH access danger-full-access → AGY --dangerously-skip-permissions/.test(m)), JSON.stringify(fullNoted));
+
 console.log("gravity modes: ok");
