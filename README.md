@@ -1,5 +1,7 @@
 # Oh My Gravity
 
+English · [简体中文](README.zh-CN.md)
+
 Run your signed-in [Antigravity CLI](https://antigravity.google/docs/cli) (`agy`) as a model provider inside [DSH](https://github.com/deepseek-ai/dsh): no API key, the login `agy` already has.
 
 **Status: alpha (`0.1.0-alpha.1`).** Unofficial and not affiliated with Google. Tested on Linux with AGY 1.5.14 and DSH 0.2.2-rc.1.

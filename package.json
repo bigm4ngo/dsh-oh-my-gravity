@@ -59,6 +59,7 @@
   "files": [
     "lib",
     "README.md",
+    "README.zh-CN.md",
     "LICENSE",
     "cordis.patch.yml",
     "icon.svg"
