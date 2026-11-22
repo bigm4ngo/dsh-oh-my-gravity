@@ -182,8 +182,16 @@ export class AgyConnection {
     clearTimeout(pending.timer);
     if ("result" in frame && !("error" in frame)) pending.resolve(frame.result);
     else {
-      const code = fields(frame.error)?.code;
-      pending.reject(new Error(`AGY ACP request failed${typeof code === "number" ? ` (${code})` : ""}`));
+      const error = fields(frame.error);
+      const code = typeof error?.code === "number" ? error.code : undefined;
+      const detail = typeof error?.message === "string" && error.message.trim() ? error.message.trim() : undefined;
+      // AGY's "Authentication required" is the sign-in expiring, not a plugin fault: say so plainly instead of a bare code.
+      if (detail && /authentication required|not signed in/i.test(detail)) {
+        pending.reject(new Error(`Antigravity sign-in required — run \`agy\` in a terminal to sign in (AGY said: ${detail})`));
+        return;
+      }
+      const suffix = detail ? ` (${code !== undefined ? `${code}: ` : ""}${detail})` : code !== undefined ? ` (${code})` : "";
+      pending.reject(new Error(`AGY ACP request failed${suffix}`));
     }
   }
 }

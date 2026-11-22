@@ -25,6 +25,7 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
       return;
     }
     if (text === 'hang') { pending = m.id; return; }
+    if (text === 'auth') { send({id:m.id, error:{code:-32000, message:'Authentication required'}}); return; }
     if (text === 'big' || text === 'huge') {
       const n = text === 'big' ? 3e6 : 40e6;
       // One write: a big pipe write is not atomic with a following console.log.
@@ -63,6 +64,8 @@ try {
   const active = connection.request("session/prompt", makePrompt("hang"));
   connection.notify("session/cancel", { sessionId: "same" });
   assert.deepEqual(await active, { stopReason: "cancelled" });
+  // An expired sign-in is named plainly, not left as a bare -32000 code.
+  await assert.rejects(connection.request("session/prompt", makePrompt("auth")), /sign-in required.*run `agy`.*Authentication required/);
   await assert.rejects(connection.request("session/prompt", makePrompt("disconnect")), /exited.*24/);
 } finally {
   await connection.close();
