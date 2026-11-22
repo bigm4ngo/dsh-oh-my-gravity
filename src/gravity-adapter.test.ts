@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createUserMessage, type GenerateOptions } from "@deepseek-ai/dsh-llm";
-import { describePermission, GravityAdapter, tokenUsage } from "./gravity-adapter.js";
+import { describePermission, fitPrompt, GravityAdapter, tokenUsage } from "./gravity-adapter.js";
 import type { ApprovalOutcome } from "./dsh.js";
 
 // Real stdio transport. The child checks that the adapter uses the intended wire requests.
@@ -324,3 +324,21 @@ try {
 }
 
 console.log("gravity adapter: ok");
+
+// fitPrompt keeps the system part and the newest messages, and says what it left out.
+{
+  const big = "x".repeat(400);
+  const parts = ["system: s", ...Array.from({ length: 10 }, (_, i) => `m${i} ${big}`)];
+  const all = fitPrompt(parts, true, 100_000);
+  assert.equal(all.dropped, 0);
+  assert.equal(all.text, parts.join("\n\n"));
+  const some = fitPrompt(parts, true, 1500);
+  assert.ok(some.dropped > 0 && some.text.startsWith("system: s\n\n[") && some.text.includes("left out"));
+  assert.ok(some.text.endsWith(`m9 ${big}`)); // the newest survives
+  assert.ok(!some.text.includes(`m0 ${big}`)); // the oldest goes first
+  assert.ok(Buffer.byteLength(JSON.stringify(some.text)) <= 1500);
+  // One message bigger than the whole budget is cut to its tail rather than refused.
+  const only = fitPrompt(["a".repeat(5000) + "END"], false, 1000);
+  assert.ok(only.text.endsWith("END") && Buffer.byteLength(JSON.stringify(only.text)) <= 1000);
+}
+console.log("fitPrompt: ok");

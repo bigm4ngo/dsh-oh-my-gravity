@@ -15,8 +15,8 @@ type Pending = {
   reject: (error: Error) => void;
   timer: NodeJS.Timeout;
 };
-/** Outgoing frames are our own prompts: small. Incoming ones carry whole tool results (a file read, command output), so the cap is generous. */
-const MAX_OUT = 1024 * 1024;
+/** Outgoing frames are our own prompts, which can carry a whole replayed context (AGY accepted 24 MiB in a probe). Incoming ones carry whole tool results (a file read, command output), so the cap is generous. */
+const MAX_OUT = 16 * 1024 * 1024;
 const MAX_IN = 32 * 1024 * 1024;
 const CANCELLED = { outcome: { outcome: "cancelled" } };
 

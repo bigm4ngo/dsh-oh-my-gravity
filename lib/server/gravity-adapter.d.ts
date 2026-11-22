@@ -25,6 +25,11 @@ type LaunchOptions = Omit<ConnectionOptions, "cwd" | "timeoutMs"> & {
     log?: (message: string) => void;
 };
 type Fields = Record<string, unknown>;
+/** Newest-first fit: keeps `head` parts (the system prompt) and as many of the latest parts as fit, noting what was left out. */
+export declare function fitPrompt(parts: readonly string[], keepFirst: boolean, budget?: number): {
+    text: string;
+    dropped: number;
+};
 type McpGrant = {
     config: McpServerConfig;
     revoke(): void;

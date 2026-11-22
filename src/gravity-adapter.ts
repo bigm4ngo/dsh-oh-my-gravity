@@ -29,6 +29,34 @@ type LaunchOptions = Omit<ConnectionOptions, "cwd" | "timeoutMs"> & { models?: r
   log?: (message: string) => void;
 };
 type Fields = Record<string, unknown>;
+
+/** AGY's prompt goes out as one frame, capped at 16 MiB by the connection (AGY itself took a 24 MiB frame in a probe); stay clear of it, since JSON escaping inflates text. DSH's own context limit keeps real prompts far below this, so trimming is a backstop. */
+const PROMPT_BUDGET = 15 * 1024 * 1024;
+const wire = (text: string) => Buffer.byteLength(JSON.stringify(text));
+
+/** Newest-first fit: keeps `head` parts (the system prompt) and as many of the latest parts as fit, noting what was left out. */
+export function fitPrompt(parts: readonly string[], keepFirst: boolean, budget = PROMPT_BUDGET): { text: string; dropped: number } {
+  const head = keepFirst ? parts.slice(0, 1) : [];
+  const rest = parts.slice(head.length);
+  const NOTE = 400;
+  let left = budget - NOTE - head.reduce((n, part) => n + wire(part) + 4, 0);
+  const kept: string[] = [];
+  for (let i = rest.length - 1; i >= 0; i--) {
+    let part = rest[i]!;
+    const size = wire(part) + 4;
+    if (size > left) {
+      if (kept.length) break;
+      // The newest message alone is too big: keep its tail, where the instruction usually is.
+      while (left > 0 && wire(part) + 4 > left && part.length) part = part.slice(Math.ceil(part.length * 0.2));
+    }
+    kept.unshift(part);
+    left -= wire(part) + 4;
+  }
+  const dropped = rest.length - kept.length;
+  const note = dropped ? [`[${dropped} earlier message${dropped === 1 ? "" : "s"} left out: they did not fit Antigravity's prompt size limit.]`] : [];
+  return { text: [...head, ...note, ...kept].join("\n\n"), dropped };
+}
+
 type McpGrant = {
   config: McpServerConfig;
   revoke(): void;
@@ -797,9 +825,11 @@ export class GravityAdapter extends LlmAdapter {
           fullAccess,
         );
       }
+      const { text: prompt, dropped } = resumed ? fitPrompt(recentParts, false) : fitPrompt(fullParts, !!options.system?.trim());
+      if (dropped) this.launch.log?.(`prompt too large for AGY: left out the ${dropped} oldest message${dropped === 1 ? "" : "s"}`);
       void conn.request("session/prompt", {
         sessionId: session.id,
-        prompt: [{ type: "text", text: (resumed ? recentParts : fullParts).join("\n\n") }],
+        prompt: [{ type: "text", text: prompt }],
       }, 15 * 60_000).then((reply) => {
         result = object(reply);
       }, (error: unknown) => {
